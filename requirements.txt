@@ -1,1 +1,5 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.10.0
+pygame 
+PyOpenGL
 dummy_test==0.1.3

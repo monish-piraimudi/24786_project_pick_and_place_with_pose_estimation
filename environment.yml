@@ -1,0 +1,17 @@
+name: adv_opt
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.12
+  - pip
+  - pytest
+
+  - cvxpy
+  - jupyter
+  - matplotlib
+  - numpy
+  - pandas
+  - scikit-learn
+  - scipy
+  - tensorboard

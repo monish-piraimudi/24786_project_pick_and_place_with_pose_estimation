@@ -1,9 +1,49 @@
+import os
+import sys
+from pathlib import Path
 
-from modules.targets import Targets
-import Sofa
+
+def _bootstrap_sofa_python():
+    lab_dir = Path(__file__).resolve().parent
+    assets_dir = lab_dir.parent.parent
+
+    if os.name == "posix":
+        sofa_root = os.environ.setdefault("SOFA_ROOT", "/opt/emio-labs/resources/sofa")
+        sofa_python = (
+            Path(sofa_root)
+            / "plugins"
+            / "SofaPython3"
+            / "lib"
+            / "python3"
+            / "site-packages"
+        )
+    else:
+        appdata = os.getenv("LOCALAPPDATA", "")
+        sofa_root = os.environ.setdefault(
+            "SOFA_ROOT", os.path.join(appdata, "Programs", "emio-labs", "resources", "sofa")
+        )
+        sofa_python = (
+            Path(sofa_root)
+            / "plugins"
+            / "SofaPython3"
+            / "lib"
+            / "python3"
+            / "site-packages"
+        )
+
+    for path in (assets_dir, sofa_python):
+        path_str = str(path)
+        if path_str not in sys.path:
+            sys.path.insert(0, path_str)
+
+
+_bootstrap_sofa_python()
+
 import csv
 import numpy as np
-import os
+import Sofa
+
+from modules.targets import Targets
 
 resultsDirectory = os.path.dirname(os.path.realpath(__file__))+"/data/results/"
 STEP=10  # Number of steps to wait before changing target
@@ -97,7 +137,6 @@ def createScene(rootnode):
     from utils.header import addHeader, addSolvers
     from parts.gripper import Gripper
     from parts.controllers.assemblycontroller import AssemblyController
-    from parts.controllers.trackercontroller import DotTracker
     from parts.emio import Emio
     import argparse
     import sys

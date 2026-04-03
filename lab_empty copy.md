@@ -1,4 +1,5 @@
-# Lab Empty
+# Practical 1: Model Learning
+
 ::: highlight
 ##### Overview
 
@@ -39,34 +40,6 @@ Equivalent datasets were recorded on the Emio robot:
 - `blueleg_beam_real_sphere1018.csv`
 
 These datasets were created by tracking the robot's tool center point (TCP) position with a _Polhemus_ magnetic tracker. These datasets have an extra column `Real Position` with the recorded tracked position.
-
-::::
-
-:::: collapse Generate Data
-## Generate Data
-
-Before training the inverse model, you can generate a fresh dataset from the SOFA simulation. The scene in `dataset_generation.py` samples target positions, solves the inverse problem in simulation, and saves the resulting end-effector positions and motor angles to the `data/results` folder.
-
-You can choose the target shape and the sampling ratio below:
-
-:::: select dataset_shape
-::: option sphere
-::: option cube
-::::
-
-#input("dataset_ratio", "Sampling ratio", "0.08")
-
-Start the generation scene with:
-#runsofa-button("assets/labs/24786_project_pick_and_place_with_pose_estimation/dataset_generation.py", "dataset_shape", "dataset_ratio")
-
-The generated CSV filename depends on the chosen target shape and on how many sampled target points are created from the selected ratio.
-
-::: exercise
-**Exercise:**
-
-Generate one `sphere` dataset and one `cube` dataset, then inspect the new CSV files in `data/results`. Compare how the sampling ratio changes the number of targets and the density of the recorded data.
-
-:::
 
 ::::
 
