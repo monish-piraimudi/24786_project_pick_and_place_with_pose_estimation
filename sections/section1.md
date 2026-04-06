@@ -9,7 +9,7 @@ Organize your lab with sections.
 Add exercices to your sections.
 Add a button to run a simulation with SOFA Robotics.
 
-#runsofa-button("assets/labs/lab_empty/lab_empty.py")
+#runsofa-button("assets/labs/24786_project_pick_and_place_with_pose_estimation/lab_empty.py")
 :::
 
 :::: quiz

@@ -16,12 +16,13 @@ from pathlib import Path
 
 import numpy as np
 
-from modules.imitation_data import EpisodeRecorder, ensure_directory
-from modules.imitation_policy import ACTION_DIM, BehaviorCloningAgent, OBSERVATION_DIM
 from modules.sofa_bootstrap import bootstrap_and_validate_sofa
 
 
 bootstrap_and_validate_sofa()
+
+from modules.imitation_data import EpisodeRecorder, ensure_directory
+from modules.imitation_policy import ACTION_DIM, BehaviorCloningAgent, OBSERVATION_DIM
 
 import Sofa
 import SofaRuntime
@@ -746,7 +747,7 @@ def build_scene(rootnode, config: PickPlaceTaskConfig) -> PickPlaceILController:
     )
     emio.effector.addObject("RigidMapping", rigidIndexPerPoint=[0, 1, 2, 3])
 
-    effector_target = modelling.addChild("EffectorTarget")
+    effector_target = modelling.addChild("Target")
     effector_target.addObject("EulerImplicitSolver", firstOrder=True)
     effector_target.addObject("CGLinearSolver", iterations=50, tolerance=1e-10, threshold=1e-10)
     initial_target = list(_motion_target(layout.cube_position, APPROACH_HEIGHT)) + [0.0, 0.0, 0.0, 1.0]

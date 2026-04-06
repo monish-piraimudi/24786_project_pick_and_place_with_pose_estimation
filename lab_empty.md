@@ -104,12 +104,12 @@ This expert is the "before training" baseline. It shows the desired task structu
 
 Run the expert baseline in SOFA:
 
-#runsofa-button("assets/labs/24786_project_pick_and_place_with_pose_estimation/pick_place_il_scene.py", "--mode", "expert", "--seed", "il_rollout_seed", "--max-steps", "300")
+#runsofa-button("assets/labs/24786_project_pick_and_place_with_pose_estimation/lab_empty.py", "--mode", "expert", "--seed", "il_rollout_seed", "--max-steps", "300")
 
 You can also launch the same scene manually:
 
 ```bash
-/opt/emio-labs/resources/sofa/bin/runSofa -a assets/labs/24786_project_pick_and_place_with_pose_estimation/pick_place_il_scene.py --argv "--mode expert --seed 1000 --max-steps 300"
+/opt/emio-labs/resources/sofa/bin/runSofa -a assets/labs/24786_project_pick_and_place_with_pose_estimation/lab_empty.py --argv "--mode expert --seed 1000 --max-steps 300"
 ```
 
 ::: exercise
@@ -284,12 +284,12 @@ Use the same `il_rollout_seed` input from Step 1 so both controllers face the sa
 
 Run the trained policy in SOFA:
 
-#runsofa-button("assets/labs/24786_project_pick_and_place_with_pose_estimation/pick_place_il_scene.py", "--mode", "policy", "--policy-path", "il_policy_path", "--seed", "il_rollout_seed", "--max-steps", "300")
+#runsofa-button("assets/labs/24786_project_pick_and_place_with_pose_estimation/lab_empty.py", "--mode", "policy", "--policy-path", "il_policy_path", "--seed", "il_rollout_seed", "--max-steps", "300")
 
 Equivalent command-line version:
 
 ```bash
-/opt/emio-labs/resources/sofa/bin/runSofa -a assets/labs/24786_project_pick_and_place_with_pose_estimation/pick_place_il_scene.py --argv "--mode policy --policy-path assets/labs/24786_project_pick_and_place_with_pose_estimation/data/results/il_pick_place/bc_policy.pth --seed 1000 --max-steps 300"
+/opt/emio-labs/resources/sofa/bin/runSofa -a assets/labs/24786_project_pick_and_place_with_pose_estimation/lab_empty.py --argv "--mode policy --policy-path assets/labs/24786_project_pick_and_place_with_pose_estimation/data/results/il_pick_place/bc_policy.pth --seed 1000 --max-steps 300"
 ```
 
 To compare fairly:
@@ -314,7 +314,7 @@ So far, the policy only learned from states visited by the expert. A common next
 
 This lab supports a simple version of that idea:
 - `collect_il_dataset.py --mode dagger`
-- `pick_place_il_scene.py --mode dagger`
+- `lab_empty.py --mode dagger`
 
 In `dagger` mode:
 - the policy action is executed in the scene

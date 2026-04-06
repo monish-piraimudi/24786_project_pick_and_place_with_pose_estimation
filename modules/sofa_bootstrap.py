@@ -22,6 +22,10 @@ def validate_sofa_python() -> None:
 def bootstrap_sofa_python() -> Path:
     project_dir = Path(__file__).resolve().parent.parent
     assets_dir = project_dir.parent.parent
+    venv_candidates = [
+        project_dir / ".venv" / "lib" / "python3.10" / "site-packages",
+        project_dir / ".venv" / "lib64" / "python3.10" / "site-packages",
+    ]
 
     if os.name == "posix":
         sofa_root = Path(os.environ.setdefault("SOFA_ROOT", "/opt/emio-labs/resources/sofa"))
@@ -38,7 +42,9 @@ def bootstrap_sofa_python() -> Path:
         sofa_root / "plugins" / "SofaPython3" / "lib" / "python3" / "site-packages"
     )
 
-    for path in (project_dir, assets_dir, sofa_python):
+    for path in (project_dir, assets_dir, sofa_python, *venv_candidates):
+        if not path.exists():
+            continue
         path_str = str(path)
         if path_str not in sys.path:
             sys.path.insert(0, path_str)
