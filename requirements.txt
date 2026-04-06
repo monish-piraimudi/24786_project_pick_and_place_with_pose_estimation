@@ -1,4 +1,7 @@
 --extra-index-url https://download.pytorch.org/whl/cpu
+numpy
+scipy
+svg.path
 torch==2.10.0
 pygame 
 PyOpenGL

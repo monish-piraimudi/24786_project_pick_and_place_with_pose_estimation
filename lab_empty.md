@@ -1,232 +1,357 @@
-# Lab Empty
+# Emio Imitation Learning
 ::: highlight
 ##### Overview
 
-The goal of this lab is to learn the inverse kinematics of Emio (calculating the required motor angles for a desired end-effector position), using a multilayer perceptron (MLP) to model the mapping from end-effector position to motor angles.
+The goal of this lab is to teach a simulated Emio robot to pick up a cube and place it in a target zone by imitation learning.
 
-You will build, train, and evaluate the MLP using PyTorch, and in the end of the lab, you will calibrate an alternative, parametric model. 
+Instead of hand-writing a controller for every situation, you will:
+- inspect a scripted expert that already solves the task
+- collect expert demonstrations in simulation
+- train a behavior-cloning policy with PyTorch
+- evaluate the learned policy offline
+- compare the expert and the trained policy directly in SOFA
+
+This lab uses privileged simulator state rather than camera images. The policy observes the robot state, cube pose, target pose, and task phase, then predicts the next end-effector motion and gripper command.
 
 :::
 
 :::: collapse Install Dependencies
+## Install Dependencies
 
-We are going to need third-parties libraries for this lab.
+This lab uses `numpy`, `scipy`, `svg.path`, and `torch`.
 
-Click the button below to install them:
-#python-button("-m pip install --target 'assets/labs/Practical1/modules/site-packages' -r 'assets/labs/Practical1/requirements.txt'")
+Install the Python packages listed in this lab's `requirements.txt`:
 
-::::
+#python-button("-m pip install -r 'assets/labs/24786_project_pick_and_place_with_pose_estimation/requirements.txt'")
 
-:::: collapse Datasets
-## Datasets
+You can also run the same command manually:
 
-The datasets used in this lab are in CSV files containing the motors angles and the corresponding end-effector positions of Emio. The datasets are located in the `data/results` folder. Both datasets have the following fields:
-- the four motors angles _m0_, _m1_, _m2_ and _m3_
-- the 3D position of the effector _pos_
-
-### Simulation
-
-Two datasets, created in simulation, are available:
-- `blueleg_beam_cube.csv`:
-- `blueleg_beam_sphere.csv`:
-
-They have been generated using the SOFA simulation of Emio, with the script `dataset_generation.py`.
-
-### Real Robot
-
-Equivalent datasets were recorded on the Emio robot:
-- `blueleg_beam_real_cube2196.csv`
-- `blueleg_beam_real_sphere1018.csv`
-
-These datasets were created by tracking the robot's tool center point (TCP) position with a _Polhemus_ magnetic tracker. These datasets have an extra column `Real Position` with the recorded tracked position.
-
-::::
-
-:::: collapse Generate Data
-## Generate Data
-
-Before training the inverse model, you can generate a fresh dataset from the SOFA simulation. The scene in `dataset_generation.py` samples target positions, solves the inverse problem in simulation, and saves the resulting end-effector positions and motor angles to the `data/results` folder.
-
-You can choose the target shape and the sampling ratio below:
-
-:::: select dataset_shape
-::: option sphere
-::: option cube
-::::
-
-#input("dataset_ratio", "Sampling ratio", "0.08")
-
-Start the generation scene with:
-#runsofa-button("assets/labs/24786_project_pick_and_place_with_pose_estimation/dataset_generation.py", "dataset_shape", "dataset_ratio")
-
-The generated CSV filename depends on the chosen target shape and on how many sampled target points are created from the selected ratio.
+```bash
+python -m pip install -r assets/labs/24786_project_pick_and_place_with_pose_estimation/requirements.txt
+```
 
 ::: exercise
 **Exercise:**
 
-Generate one `sphere` dataset and one `cube` dataset, then inspect the new CSV files in `data/results`. Compare how the sampling ratio changes the number of targets and the density of the recorded data.
+Install the dependencies, then open the following files and skim their top-level docstrings:
+- `modules/pick_place_il.py`
+- `modules/imitation_data.py`
+- `modules/imitation_policy.py`
+
+Identify which file defines the task and controller, which file handles dataset utilities, and which file defines the learned policy.
 
 :::
 
 ::::
 
-:::: collapse Create MLP Model
+:::: collapse Task Overview
+## Task Overview
 
-### Create MLP Model
+The task is a single-cube pick-and-place problem:
+- a cube starts at a randomized position on the table
+- a green target zone is placed at another randomized position
+- Emio must move down, grasp the cube, lift it, move to the target, release it, and retreat
 
-You will use a multilayer perceptron (MLP) with two hidden layers of 128 neurons each. The input layer will have 3 neurons (the x, y, z coordinates of the end-effector position) and the output layer will have 4 neurons (the 4 motors angles).
+Three code areas drive the pipeline:
+- `modules/pick_place_il.py`
+  Builds the SOFA scene, defines the 29-dimensional observation, the 4-dimensional action, the scripted expert finite-state machine, and the rollout controller.
+- `modules/imitation_data.py`
+  Records episodes, splits datasets by episode, flattens trajectories for training, and aggregates rollout metrics.
+- `modules/imitation_policy.py`
+  Defines the behavior-cloning neural network, saves the checkpoint, and reloads the checkpoint with normalization statistics for inference.
 
-The activation function used in the hidden layers is the sigmoid function and there is no activation function in the output layer.
+The observation seen by the policy contains:
+- end-effector position
+- cube position
+- target position
+- relative vectors between these objects
+- four motor values
+- gripper opening
+- held/contact state
+- one-hot task phase
+
+The action predicted by the expert or learned policy contains:
+- `dx`, `dy`, `dz` end-effector motion
+- one scalar gripper command
 
 ::: exercise
-**Exercise 1:**
-In the file `modules/pytorch_mlp.py`, complete the code to create a PyTorch MLP 
-with 2 linear layers of 128 neurons each (`nn.Linear`), and a sigmoid activation function at the hidden layers (`nn.Sigmoid`).
+**Exercise:**
+
+Open `modules/pick_place_il.py` and find where the observation vector and action vector are assembled. Match each observation block to a physical quantity in the scene.
 
 :::
 
 ::::
 
-:::: collapse Train MLP Model
-### Train MLP Model 
+:::: collapse Step 1: Inspect The Task And Expert
+## Step 1: Inspect The Task And Expert
 
-To train your model, you will run the provided `train_model.py` script. 
-The script will preprocess the data, build the MLP, train it, and save the trained model to the specified location.
+Before training a model, it helps to watch the behavior we want the policy to imitate.
 
-::: exercise
-**Exercise 2:**
+The scripted expert in `modules/pick_place_il.py` uses a finite-state machine with these phases:
+- `approach_pick`
+- `descend_pick`
+- `close_gripper`
+- `lift`
+- `approach_place`
+- `descend_place`
+- `open_gripper`
+- `retreat`
 
-1. In `modules/pytorch_mlp.py`, finish implementing the training loop. As loss, use the mean-square error `nn.MSELoss()`. As solver, you can use the Adam algorithm `optimizer = optim.Adam(self.model.parameters())`
+This expert is the "before training" baseline. It shows the desired task structure and produces the demonstrations used for behavior cloning.
 
-2. Train the model, using the `train_model.py`: 
-<!-- Removed from below: [--from-real] -->
+#input("il_rollout_seed", "Rollout seed", "1000")
+
+Run the expert baseline in SOFA:
+
+#runsofa-button("assets/labs/24786_project_pick_and_place_with_pose_estimation/pick_place_il_scene.py", "--mode", "expert", "--seed", "il_rollout_seed", "--max-steps", "300")
+
+You can also launch the same scene manually:
+
 ```bash
-python train_model.py --model-type pytorch --dataset-path data/results/blueleg_beam_cube.csv 
+/opt/emio-labs/resources/sofa/bin/runSofa -a assets/labs/24786_project_pick_and_place_with_pose_estimation/pick_place_il_scene.py --argv "--mode expert --seed 1000 --max-steps 300"
 ```
 
-3. Inspect the convergence. If necessary, tune the parameters of Adam for better results. 
+::: exercise
+**Exercise:**
+
+Run the expert scene and describe the eight phases of the task in your own words. What information do you think the policy will need in order to imitate this behavior?
 
 :::
+
 ::::
 
-:::: collapse Evaluate MLP Model
-### Evaluate MLP Model
+:::: collapse Step 2: Collect Demonstrations
+## Step 2: Collect Demonstrations
 
-First, we can do a statistical evaluation. We evaluate the performance of the trained dataset on other datasets.  
+The script `collect_il_dataset.py` rolls out the expert controller and saves each successful trajectory as an `.npz` episode file in `data/results/il_pick_place/episodes`.
 
-::: exercise
-**Exercise 3:**
+Each saved rollout also contributes an entry to `manifest.json`, which summarizes:
+- episode id
+- seed
+- success flags
+- final place error
+- failure phase
+- saved file path
 
-Evaluate the learned model by calling
+Collect a starter dataset:
+
+#python-button("assets/labs/24786_project_pick_and_place_with_pose_estimation/collect_il_dataset.py --episodes 20 --max-attempts 40")
+
+Equivalent command-line version:
+
 ```bash
-python evaluate_model.py --model-type pytorch --dataset-path <path/to/dataset.csv> --model-path data/results/blueleg_beam_cube.pth
+python assets/labs/24786_project_pick_and_place_with_pose_estimation/collect_il_dataset.py --episodes 20 --max-attempts 40
 ```
 
-Replace `<path/to/dataset.csv>` by each of the four datasets. Comment in your report. On what dataset does the model perform best? On which one does it perform worst? Can you explain the observed behavior? 
+By default, this stores trajectories in:
+- `data/results/il_pick_place/episodes/episode_*.npz`
+- `data/results/il_pick_place/episodes/manifest.json`
+
+::: exercise
+**Exercise:**
+
+Collect a small dataset, then inspect `data/results/il_pick_place/episodes`. How many attempts were needed to save the requested number of successful expert episodes?
 
 :::
 
-Finally, you can use your model to control the robot. The scene `sofa_sim.py` is already set up to use your trained model. You just need to specify the path to your model file in the scene:
-#input("eval_pytorch_model_path", "Path to the model pth file", "assets/labs/Practical1/data/results/blueleg_beam_cube.pth")
+::::
 
-The effector will then move to the different targets sampled along the sphere or cube, as shown below:
+:::: collapse Step 3: Understand The Dataset Format
+## Step 3: Understand The Dataset Format
 
-![](assets/labs/Practical1/data/images/evaluation_sphere.png)
+Imitation-learning data is first stored by episode, not as one giant table. This preserves rollout order and makes it easier to inspect success and failure.
+
+In `modules/imitation_data.py`:
+- `EpisodeRecorder` logs one rollout step by step
+- `split_episode_paths(...)` creates train, validation, and test splits by episode
+- `flatten_episode_dataset(...)` turns many episodes into stacked training arrays
+- `aggregate_rollout_metrics(...)` computes rollout-level metrics after evaluation
+
+Each saved episode contains arrays such as:
+- `observation`
+- `action`
+- `executed_action`
+- `phase_index`
+- `episode_step`
+- `cube_pose`
+- `target_position`
+- `effector_pose`
+- `gripper_opening`
+- success flags
+
+Why split by episode instead of by individual row? Consecutive timesteps from the same rollout are highly correlated. If they leak across train and validation sets, the model can appear better than it really is.
 
 ::: exercise
+**Exercise:**
 
-**Exercise 4:**
+Open `modules/imitation_data.py` and explain:
+1. why the split is done by episode
+2. why the training dataset is flattened only after splitting
+3. why rollout metrics are different from training loss
 
-Run the sofa simulation and observe how the robot moves to the prescribed points. Describe the behavior in your report. 
-
-For **Ubuntu** users, use this button first to start the inference server:
-#python-button("'assets/labs/Practical1/inferenceServer.py' data/results/blueleg_beam_cube.pth")
-
-
-Start the simulation by pressing the SOFA button below:
-#runsofa-button("assets/labs/Practical1/sofa_sim.py", "eval_pytorch_model_path", "sphere", "0.1")
+Then inspect one saved `.npz` episode and identify which keys correspond to the policy input and the expert target action.
 
 :::
 
-After successfully completing Exercise 4 and showing the working simulation to your teaching crew, you may continue with Exercise 5. 
-
-::: exercise
-
-**Exercise 5:**
-
-Run the above script on the real robot. Describe the observed behavior in your report. 
-
-:::
-
-<!-- Do a more comprehensive performance study of the model, dataset, and optimizer. This is where your creativity is required! Think about some interesting phenomenon to study, formulate a hypothesis, and then run a little experiment to test this. Feel free to ask your classmates and the teaching crew to brainstorm some ideas. -->
-
 ::::
 
-:::: collapse Parametric Model Learning 
+:::: collapse Step 4: Train The Policy
+## Step 4: Train The Policy
 
-Learning inverse kinematics with a deep neural network is one way to do things, but certainly not the only and possibly not the optimal way. In the next practical, we 
-will solve inverse kinematics using a model-based way. However, to get good performance, we will need accurate models. We can use physical principles to setup good models but there are always some parameters that need to be tuned. We can learn these parameters using collected data. This is called calibration or parametric model learning.
+The learned policy is defined in `modules/imitation_policy.py` as a small multilayer perceptron with:
+- input dimension `29`
+- two hidden layers of size `128`
+- ReLU activations
+- output dimension `4`
 
-::: exercise
-**Exercise 6:**
+Training is performed by `train_il_policy.py`. The script:
+- loads saved episode files
+- splits them into train, validation, and test sets
+- flattens the trajectories
+- normalizes the observations
+- trains the behavior-cloning model with mean-squared error
+- saves the checkpoint together with `obs_mean` and `obs_std`
 
-- In `train_model.py`, there is an option to use `calibrated` instead of `pytorch`. Inspect the code for the proposed calibration and comment on the implementation. In particular, what principle is being used here to calibrate the Young modulus?
+Those normalization statistics are saved because inference must preprocess observations the same way training did.
 
-- Go to `train_model.py` and make sure the default variable is set to calibrated: `DEFAULT="calibrated"`. 
+Train the policy:
 
-- By clicking the below button, you run `train_model.py` using the calibrated option. Observe the convergence behavior. Do you understand why the algorithm behaves the way it does? 
+#python-button("assets/labs/24786_project_pick_and_place_with_pose_estimation/train_il_policy.py --dataset-dir data/results/il_pick_place/episodes --output-path data/results/il_pick_place/bc_policy.pth")
 
-#python-button("assets/labs/Practical1/train_model.py")
+Equivalent command-line version:
 
-
-::: 
-
-In Practical 2, we will fix the above behavior and use the calibrated model in our inverse kinematics pipeline, and you can then properly compare this model-based approach with the deep-learning approach. 
-
-::::
-
-
-### Appendix 
-
-:::::: collapse Dataset Generation
-
-::::: exercise
-**Generation SOFA Scene:**
-
-You can generate your own dataset using this scene.
-This will generate a dataset into the _data/results_ folder.
-
-:::: select dataset_shape 
-::: option sphere
-::: option cube
-::::
-
-#input("dataset_ratio", "Ratio to sample (the higher the coarser)", "0.08")
-
-#runsofa-button("assets/labs/Practical1/lab_AI_dataset_generation.py", "dataset_shape", "dataset_ratio")
-
-<br>
-
-Here is is an excerpt of the _blueleg_beam_sphere.csv_ dataset file that comes with this lab:
-
-```text
-# extended ;1
-# legs ;['blueleg']
-# legs model ;['beam']
-# legs young modulus ;[35000.]
-# legs poisson ratio ;[0.45]
-# legs position on motor ;['counterclockwisedown', 'clockwisedown', 'counterclockwisedown', 'clockwisedown']
-# connector ;bluepart
-# connector type ;rigid
-Effector position;Motor angle
-[-39.96175515 -90.41789743 -39.96175525];[-0.14670205865712832, 0.14670207392254797, 2.43823807942873, -2.438238056118855]
-[-39.95720099 -90.4415037  -31.95609913];[0.1329811350050557, 0.13624487007045172, 2.29165178728331, -2.488099187824528]
-[-39.95397373 -90.45505537 -23.95436099];[0.4217800556565714, 0.13599500085968805, 2.113863614076125, -2.5101582582004642]
-[-39.9514583  -90.46332739 -15.96017202];[0.7233308263521361, 0.14326494422921077, 1.8979428979904553, -2.5098560718291005]
-[-39.95029449 -90.46182801  -7.97640971];[1.0359369002803307, 0.15246389567464924, 1.640800631571854, -2.4992699487352867]
-[-3.99504339e+01 -9.04556845e+01 -8.41130293e-05];[1.3485569542409783, 0.1566254899703859, 1.3478513803217718, -2.4934454150763674]
+```bash
+python assets/labs/24786_project_pick_and_place_with_pose_estimation/train_il_policy.py --dataset-dir data/results/il_pick_place/episodes --output-path data/results/il_pick_place/bc_policy.pth
 ```
 
-:::::
+The trained checkpoint is saved to:
+- `data/results/il_pick_place/bc_policy.pth`
 
-::::::
+::: exercise
+**Exercise:**
+
+Train the model and inspect the printed training and validation losses. Why is observation normalization especially important here, given that positions, motor values, gripper opening, and phase indicators all appear in the same input vector?
+
+:::
+
+::::
+
+:::: collapse Step 5: Evaluate The Trained Policy
+## Step 5: Evaluate The Trained Policy
+
+The script `evaluate_il_policy.py` runs the learned controller in closed loop and reports rollout-level metrics.
+
+These metrics measure task performance, not just prediction error:
+- `pick_success`
+- `place_success`
+- `total_success`
+- `final_place_error_mm`
+- `dropped_object_rate`
+- `failure_phase_counts`
+
+Evaluate the trained policy:
+
+#python-button("assets/labs/24786_project_pick_and_place_with_pose_estimation/evaluate_il_policy.py --mode policy --policy-path data/results/il_pick_place/bc_policy.pth")
+
+Equivalent command-line version:
+
+```bash
+python assets/labs/24786_project_pick_and_place_with_pose_estimation/evaluate_il_policy.py --mode policy --policy-path data/results/il_pick_place/bc_policy.pth
+```
+
+Evaluation writes results to:
+- `data/results/il_pick_place/eval/rollout_manifest.json`
+- `data/results/il_pick_place/eval/metrics.json`
+
+::: exercise
+**Exercise:**
+
+Compare the evaluation metrics to the expert behavior you observed earlier. If the total success rate is lower than the expert baseline, what kinds of mistakes do you think behavior cloning is making?
+
+:::
+
+::::
+
+:::: collapse Step 6: Watch The Trained Policy In SOFA
+## Step 6: Watch The Trained Policy In SOFA
+
+Now compare the scripted expert and the trained policy on the same randomized task.
+
+#input("il_policy_path", "Path to trained policy", "assets/labs/24786_project_pick_and_place_with_pose_estimation/data/results/il_pick_place/bc_policy.pth")
+
+Use the same `il_rollout_seed` input from Step 1 so both controllers face the same cube and target placement.
+
+Run the trained policy in SOFA:
+
+#runsofa-button("assets/labs/24786_project_pick_and_place_with_pose_estimation/pick_place_il_scene.py", "--mode", "policy", "--policy-path", "il_policy_path", "--seed", "il_rollout_seed", "--max-steps", "300")
+
+Equivalent command-line version:
+
+```bash
+/opt/emio-labs/resources/sofa/bin/runSofa -a assets/labs/24786_project_pick_and_place_with_pose_estimation/pick_place_il_scene.py --argv "--mode policy --policy-path assets/labs/24786_project_pick_and_place_with_pose_estimation/data/results/il_pick_place/bc_policy.pth --seed 1000 --max-steps 300"
+```
+
+To compare fairly:
+1. run the expert baseline with one seed
+2. keep the seed the same
+3. run the trained policy
+4. compare where the learned controller succeeds, hesitates, or fails
+
+::: exercise
+**Exercise:**
+
+Run the expert and trained policy on the same seed. Describe at least one behavior that the learned policy copies well and one behavior where it differs from the expert.
+
+:::
+
+::::
+
+:::: collapse Optional Extension: DAgger
+## Optional Extension: DAgger
+
+So far, the policy only learned from states visited by the expert. A common next step is DAgger: let the policy act, but query the expert for the correct action at the visited states and add those corrections to the dataset.
+
+This lab supports a simple version of that idea:
+- `collect_il_dataset.py --mode dagger`
+- `pick_place_il_scene.py --mode dagger`
+
+In `dagger` mode:
+- the policy action is executed in the scene
+- the expert action is still logged as the learning target
+
+Example collection command:
+
+```bash
+python assets/labs/24786_project_pick_and_place_with_pose_estimation/collect_il_dataset.py --mode dagger --policy-path data/results/il_pick_place/bc_policy.pth --episodes 20 --max-attempts 40
+```
+
+::: exercise
+**Exercise:**
+
+Why might DAgger improve a behavior-cloning policy that performs well near expert trajectories but fails after making a small mistake of its own?
+
+:::
+
+::::
+
+:::: collapse Summary
+## Summary
+
+In this lab you:
+- observed the scripted expert that defines the target behavior
+- collected expert demonstrations from the simulator
+- inspected how episodes are stored and prepared for training
+- trained a behavior-cloning policy
+- evaluated the learned controller with rollout metrics
+- compared the expert and the trained policy directly in SOFA
+
+This is the standard imitation-learning workflow in its simplest form:
+- expert policy
+- demonstration dataset
+- supervised learning
+- closed-loop rollout evaluation
+
+Once this baseline works, you can explore better policies, more data, DAgger, or richer observations.
+
+::::
