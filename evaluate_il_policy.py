@@ -4,7 +4,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from modules.imitation_data import aggregate_rollout_metrics, ensure_directory, write_manifest
-from modules.pick_place_il import PickPlaceTaskConfig, run_single_episode
+from modules.pick_place_il_runtime import PickPlaceTaskConfig, run_single_episode
 
 
 def main():
@@ -29,6 +29,41 @@ def main():
         action="store_true",
         help="Save rollout trajectories as .npz files during evaluation",
     )
+    parser.add_argument(
+        "--connection",
+        action="store_true",
+        help="Enable the real robot connection components in the scene",
+    )
+    parser.add_argument(
+        "--camera-tracking",
+        action="store_true",
+        help="Use Emio camera tracking to localize the cube marker during rollouts",
+    )
+    parser.add_argument(
+        "--camera-preview",
+        action="store_true",
+        help="Show the Emio camera preview feed when camera tracking is enabled",
+    )
+    parser.add_argument(
+        "--cube-marker-offset-mm",
+        type=float,
+        nargs=3,
+        metavar=("X", "Y", "Z"),
+        default=(0.0, 0.0, 0.0),
+        help="Fixed XYZ offset from the tracked cube marker to the cube center in millimeters",
+    )
+    parser.add_argument(
+        "--object-jitter-mm",
+        type=float,
+        default=15.0,
+        help="Random X/Z jitter applied to the spawned block position",
+    )
+    parser.add_argument(
+        "--place-jitter-mm",
+        type=float,
+        default=0.0,
+        help="Random X/Z jitter applied to the place target position. Default keeps the place target fixed.",
+    )
     args = parser.parse_args()
 
     if args.mode == "policy" and not args.policy_path:
@@ -41,6 +76,12 @@ def main():
         output_dir=str(output_dir / "episodes") if args.save_rollouts else None,
         log_episode=args.save_rollouts,
         save_failed_episodes=args.save_rollouts,
+        connection=args.connection,
+        camera_tracking=args.camera_tracking,
+        camera_preview=args.camera_preview,
+        cube_marker_offset_mm=tuple(float(value) for value in args.cube_marker_offset_mm),
+        object_jitter_mm=args.object_jitter_mm,
+        place_jitter_mm=args.place_jitter_mm,
     )
 
     entries = []

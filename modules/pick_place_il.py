@@ -1,721 +1,838 @@
-"""Single-task Emio imitation-learning scene for cube pick and place.
-
-The overall loop is:
-1. Randomize the cube and target-zone layout.
-2. Roll out a scripted expert policy in the simulator.
-3. Log observation-action trajectories as training data.
-4. Train a behavior-cloning policy offline on those trajectories.
-5. Run the learned policy closed loop back inside SOFA for evaluation.
-"""
-
-from __future__ import annotations
-
-import math
-from dataclasses import dataclass, replace
+import argparse
+import glob
+import os
+import sys
+import traceback
 from pathlib import Path
 
 import numpy as np
-
-from modules.sofa_bootstrap import bootstrap_and_validate_sofa
-
-
-bootstrap_and_validate_sofa()
-
-from modules.imitation_data import EpisodeRecorder, ensure_directory
-from modules.imitation_policy import ACTION_DIM, BehaviorCloningAgent, OBSERVATION_DIM
-
 import Sofa
-import SofaRuntime
+
+try:
+    import Sofa.ImGui as MyGui
+except ImportError:
+    MyGui = None
+
+sys.path.append(os.path.dirname(os.path.realpath(__file__)) + "/../../")
+
+from modules.camera_observation import default_image_shape
+from modules.pick_place_policy_shared import (
+    MAX_EPISODE_STEPS,
+    PHASE_NAMES,
+    advance_phase,
+    apply_policy_action,
+    phase_opening,
+    phase_target,
+    render_observation,
+)
 
 
-PHASE_NAMES = [
-    "approach_pick",
-    "descend_pick",
-    "close_gripper",
-    "lift",
-    "approach_place",
-    "descend_place",
-    "open_gripper",
-    "retreat",
-]
-PHASE_INDEX = {name: index for index, name in enumerate(PHASE_NAMES)}
-
+_RUNTIME_TASK_TUNING = None
 PROJECT_DIR = Path(__file__).resolve().parent.parent
-UNIT_CUBE_MESH = PROJECT_DIR / "data" / "meshes" / "il_unit_cube.obj"
-
-CONTROL_DT = 0.03
-MAX_EPISODE_STEPS = 300
-ACTION_LIMIT_MM = 5.0
-
-TABLE_SIZE = np.array([150.0, 8.0, 150.0], dtype=np.float32)
-TABLE_TOP_Y = -170.0
-CUBE_SIZE = 20.0
-CUBE_HALF = CUBE_SIZE / 2.0
-CUBE_MASS = 0.025
-TARGET_RADIUS = 18.0
-
-BASE_CUBE_POSITION = np.array([-25.0, TABLE_TOP_Y + CUBE_HALF, 0.0], dtype=np.float32)
-BASE_TARGET_POSITION = np.array([35.0, TABLE_TOP_Y + CUBE_HALF, 0.0], dtype=np.float32)
-
-OPENING_OPEN_MM = 42.0
-OPENING_CLOSED_MM = 12.0
-OPENING_SWITCH_MM = 18.0
-
-APPROACH_HEIGHT = 30.0
-GRASP_HEIGHT = 5.0
-LIFT_HEIGHT = 40.0
-PLACE_HEIGHT = 5.0
-RETREAT_HEIGHT = 30.0
-POSE_TOLERANCE_MM = 3.0
-
-CONTACT_LATERAL_TOLERANCE = 14.0
-CONTACT_VERTICAL_TOLERANCE = 18.0
-GRASP_CONFIRM_STEPS = 5
-PLACE_SPEED_TOLERANCE = 3.0
-
-MODE_CHOICES = {"expert", "collect", "policy", "dagger"}
 
 
-@dataclass
-class PickPlaceTaskConfig:
-    """Runtime configuration for one rollout.
+def set_runtime_task_tuning(tuning):
+    global _RUNTIME_TASK_TUNING
+    if tuning is None:
+        _RUNTIME_TASK_TUNING = None
+        return
 
-    The main modes are:
-    - expert: execute the scripted policy without saving data
-    - collect: execute the expert and log episodes for behavior cloning
-    - policy: execute the learned policy
-    - dagger: execute the learned policy but log expert corrections
-    """
-
-    mode: str = "expert"
-    policy_path: str | None = None
-    output_dir: str | None = None
-    episode_id: int = 0
-    seed: int = 0
-    max_steps: int = MAX_EPISODE_STEPS
-    control_dt: float = CONTROL_DT
-    with_gui: bool = False
-    log_episode: bool = False
-    save_failed_episodes: bool = False
-
-
-@dataclass
-class EpisodeLayout:
-    """Randomized initial positions for one episode."""
-
-    cube_position: np.ndarray
-    cube_quaternion: np.ndarray
-    target_position: np.ndarray
-
-
-def _yaw_to_quaternion(yaw_degrees: float) -> np.ndarray:
-    """Convert a cube yaw angle into the rigid-pose quaternion used by SOFA."""
-
-    radians = math.radians(yaw_degrees)
-    return np.array([0.0, math.sin(radians / 2.0), 0.0, math.cos(radians / 2.0)], dtype=np.float32)
-
-
-def sample_episode_layout(seed: int) -> EpisodeLayout:
-    """Sample the small pose variations used to diversify training data."""
-
-    rng = np.random.default_rng(seed)
-    cube_offset = rng.uniform(-15.0, 15.0, size=2)
-    target_offset = rng.uniform(-15.0, 15.0, size=2)
-    cube_yaw = float(rng.uniform(-15.0, 15.0))
-
-    cube_position = BASE_CUBE_POSITION.copy()
-    cube_position[[0, 2]] += cube_offset
-
-    target_position = BASE_TARGET_POSITION.copy()
-    target_position[[0, 2]] += target_offset
-
-    return EpisodeLayout(
-        cube_position=cube_position.astype(np.float32),
-        cube_quaternion=_yaw_to_quaternion(cube_yaw),
-        target_position=target_position.astype(np.float32),
-    )
-
-
-def _clip_delta(delta: np.ndarray) -> np.ndarray:
-    """Limit Cartesian action steps so both expert and policy stay comparable."""
-
-    return np.clip(delta.astype(np.float32), -ACTION_LIMIT_MM, ACTION_LIMIT_MM)
-
-
-def _motion_target(position: np.ndarray, height: float) -> np.ndarray:
-    """Build a waypoint above a reference position for the FSM expert."""
-
-    return np.array([position[0], position[1] + height, position[2]], dtype=np.float32)
-
-
-def _build_rigid_box(
-    parent,
-    name: str,
-    position: np.ndarray,
-    quaternion: np.ndarray,
-    scale3d: np.ndarray,
-    color: list[float],
-    total_mass: float,
-    fixed: bool,
-    collision_group: int = 0,
-):
-    """Create a simple rigid object with both visual and collision geometry."""
-
-    node = parent.addChild(name)
-    rigid_pose = list(position.astype(float)) + list(quaternion.astype(float))
-    node.addObject("MechanicalObject", template="Rigid3", position=[rigid_pose])
-    node.addObject("UniformMass", totalMass=float(total_mass))
-    if fixed:
-        node.addObject("FixedProjectiveConstraint", indices=[0])
-
-    visual = node.addChild("Visual")
-    visual.addObject(
-        "MeshOBJLoader",
-        name="loader",
-        filename=str(UNIT_CUBE_MESH),
-        scale3d=list(scale3d.astype(float)),
-    )
-    visual.addObject("OglModel", src=visual.loader.linkpath, color=color)
-    visual.addObject("RigidMapping")
-
-    collision = node.addChild("Collision")
-    collision.addObject(
-        "MeshOBJLoader",
-        name="loader",
-        filename=str(UNIT_CUBE_MESH),
-        scale3d=list(scale3d.astype(float)),
-    )
-    collision.addObject("MeshTopology", src=collision.loader.linkpath)
-    collision.addObject("MechanicalObject", src=collision.loader.linkpath)
-    collision.addObject(
-        "TriangleCollisionModel",
-        contactStiffness=200,
-        group=collision_group,
-        moving=int(not fixed),
-        simulated=int(not fixed),
-    )
-    collision.addObject(
-        "LineCollisionModel",
-        contactStiffness=200,
-        group=collision_group,
-        moving=int(not fixed),
-        simulated=int(not fixed),
-    )
-    collision.addObject(
-        "PointCollisionModel",
-        contactStiffness=200,
-        group=collision_group,
-        moving=int(not fixed),
-        simulated=int(not fixed),
-    )
-    collision.addObject("RigidMapping")
-    return node
-
-
-def _add_gripper_collision_model(centerpart, group: int = 1):
-    """Build a local collision model for the gripper center part.
-
-    The shared helper in the upstream assets currently trips over a SOFA data
-    type mismatch, so this scene uses a local version that is safe for the IL
-    prototype.
-    """
-
-    collision_parent = centerpart.part if centerpart.model.value == "tetra" else centerpart
-    collision = collision_parent.addChild("CollisionModel")
-    collision_mesh = centerpart._getFilePath(centerpart.partName.value + ".stl")
-    if collision_mesh is None:
-        raise RuntimeError(
-            f"Could not find a collision mesh for center part '{centerpart.partName.value}'"
-        )
-
-    collision.addObject("MeshSTLLoader", filename=collision_mesh, rotation=centerpart.rotation.value)
-    collision.addObject("MeshTopology", src=collision.MeshSTLLoader.linkpath)
-    collision.addObject("MechanicalObject")
-    collision.addObject("PointCollisionModel", group=group)
-    collision.addObject("LineCollisionModel", group=group)
-    collision.addObject("TriangleCollisionModel", group=group)
-
-    if centerpart.model.value == "tetra":
-        collision.addObject("BarycentricMapping")
-    else:
-        collision.addObject("SkinningMapping")
-
-    return collision
-
-
-def _read_motor_states(emio) -> np.ndarray:
-    """Read the 4 motor values that become part of the policy observation."""
-
-    values = []
-    for motor in emio.motors:
-        actuator = motor.JointActuator
-        if actuator.findData("angle"):
-            values.append(float(actuator.angle.value))
-        elif actuator.findData("displacement"):
-            values.append(float(actuator.displacement.value))
+    runtime_tuning = {}
+    for key, value in tuning.items():
+        if isinstance(value, (list, tuple, np.ndarray)):
+            runtime_tuning[key] = list(np.asarray(value, dtype=float))
         else:
-            values.append(float(actuator.value.value))
-    return np.asarray(values, dtype=np.float32)
+            runtime_tuning[key] = float(value)
+    _RUNTIME_TASK_TUNING = runtime_tuning
 
 
-class PickPlaceILController(Sofa.Core.Controller):
-    """SOFA controller that can play expert, policy, or DAgger collection roles."""
+def _parse_scene_args(argv=None):
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument(
+        "--mode",
+        choices=["expert", "policy_inspect"],
+        default="expert",
+    )
+    parser.add_argument(
+        "--policy-path",
+        type=str,
+        default="data/results/il_pick_place/bc_policy.pth",
+    )
+    parser.add_argument("--cube-x-mm", dest="cube_x_mm", type=float, default=None)
+    parser.add_argument("--cube-z-mm", dest="cube_z_mm", type=float, default=None)
+    parser.add_argument("--connection", dest="connection", action="store_true")
+    parser.add_argument("--no-connection", dest="connection", action="store_false")
+    parser.add_argument("--camera-tracking", dest="camera_tracking", action="store_true")
+    parser.add_argument("--no-camera-tracking", dest="camera_tracking", action="store_false")
+    parser.add_argument("--camera-preview", dest="camera_preview", action="store_true")
+    parser.add_argument("--no-camera-preview", dest="camera_preview", action="store_false")
+    parser.add_argument(
+        "--cube-marker-offset-mm",
+        dest="cube_marker_offset_mm",
+        nargs=3,
+        type=float,
+        metavar=("X", "Y", "Z"),
+        default=(0.0, 0.0, 0.0),
+    )
+    parser.set_defaults(
+        connection=True,
+        camera_tracking=False,
+        camera_preview=False,
+    )
+    args, _unknown = parser.parse_known_args(argv)
+    return args
+
+
+def _resolve_tray_mesh_path():
+    """Resolve tray mesh across local lab copies and emio-labs installs."""
+    scene_dir = os.path.dirname(os.path.realpath(__file__))
+
+    direct_candidates = [
+        os.path.normpath(os.path.join(scene_dir, "../../data/meshes/tray.stl")),
+        os.path.normpath(os.path.join(scene_dir, "../data/meshes/tray.stl")),
+        os.path.normpath(os.path.join(scene_dir, "data/meshes/tray.stl")),
+    ]
+
+    # Try parent roots to support running from copied lab folders.
+    probe = scene_dir
+    for _ in range(8):
+        direct_candidates.append(os.path.join(probe, "data/meshes/tray.stl"))
+        direct_candidates.append(os.path.join(probe, "assets/data/meshes/tray.stl"))
+        parent = os.path.dirname(probe)
+        if parent == probe:
+            break
+        probe = parent
+
+    # Also try emio-labs versioned installs under the user home folder.
+    emio_candidates = sorted(
+        glob.glob(os.path.expanduser("~/emio-labs/*/assets/data/meshes/tray.stl"))
+    )
+    direct_candidates.extend(emio_candidates)
+
+    for path in direct_candidates:
+        if os.path.isfile(path):
+            return path
+
+    return None
+
+
+def _vec3_distance(a, b):
+    return float(np.linalg.norm(np.array(a) - np.array(b)))
+
+
+def _is_valid_tracker_xyz(xyz):
+    xyz = np.asarray(xyz, dtype=float).reshape(-1)
+    if xyz.size < 3 or not np.all(np.isfinite(xyz[:3])):
+        return False
+    return float(np.linalg.norm(xyz[:3])) > 1e-3
+
+
+def _default_task_tuning():
+    """Return one selected parameter set for the task."""
+
+    success_params = {
+        "gripper_opening_open": 30.0,
+        "gripper_opening_closed": 12.0,
+        "gripper_opening_min": 5.0,
+        "gripper_opening_max": 35.0,
+        "pick_position": [-3.0, -165.0, 12.0],
+        "place_position": [-24.0, -165.0, -20.0],
+        "object_position": [-3.0, -170.0, 12.0],
+        "hover_lift_height": 42.0,
+        "pick_height_offset": 9.0,
+        "place_height_offset": 11.0,
+        "lift_success_delta": 30.0,
+    }
+
+    fail_params = {
+        "gripper_opening_open": 30.0,
+        "gripper_opening_closed": 12.0,
+        "gripper_opening_min": 5.0,
+        "gripper_opening_max": 35.0,
+        "pick_position": [5.0, -165.0, 20.0],
+        "place_position": [-24.0, -165.0, -12.0],
+        "object_position": [-3.0, -170.0, 12.0],
+        "hover_lift_height": 42.0,
+        "pick_height_offset": 9.0,
+        "place_height_offset": 11.0,
+        "lift_success_delta": 30.0,
+    }
+    # Select the most specific non-empty parameter set.
+    if success_params:
+        return success_params
+    return fail_params
+
+
+class PickAndPlaceEvaluator(Sofa.Core.Controller):
 
     def __init__(
         self,
-        emio,
-        cube,
-        target_zone,
-        tcp,
-        effector_target,
-        layout: EpisodeLayout,
-        config: PickPlaceTaskConfig,
+        root,
+        block_mo,
+        tcp_mo,
+        gripper_mo,
+        gripper_opening,
+        object_position,
+        pick_position,
+        place_position,
+        gripper_opening_closed,
+        lift_success_delta,
     ):
-        super().__init__()
-        self.name = "PickPlaceILController"
-        self.emio = emio
-        self.cube = cube
-        self.target_zone = target_zone
-        self.tcp = tcp
-        self.effector_target = effector_target
-        self.layout = layout
-        self.config = config
+        Sofa.Core.Controller.__init__(self)
+        self.name = "PickAndPlaceEvaluator"
 
+        self.root = root
+        self.block_mo = block_mo
+        self.tcp_mo = tcp_mo
+        self.gripper_mo = gripper_mo
+        self.gripper_opening = gripper_opening
+        self.object_position = np.array(object_position)
+        self.pick_position = np.array(pick_position)
+        self.place_position = np.array(place_position)
+        self.gripper_opening_closed = float(gripper_opening_closed)
+        self.tray_height = float(object_position[1])
+        self.lift_success_delta = float(lift_success_delta)
+        self.attach_distance_threshold = 11.0
+        self.attach_opening_threshold = self.gripper_opening_closed + 0.5
+        self.attach_offset = np.array([0.0, -10.0, 0.0], dtype=float)
+        self.is_attached = False
+        self.lifted = False
+        self.placed = False
+        self.is_falling = False
+        self._runtime_error_logged = False
+        self._frame_count = 0
+        print("[P3][Evaluator] Initialized")
+
+    def reset_task(self, object_position, pick_position):
+        self.object_position = np.asarray(object_position, dtype=float)
+        self.pick_position = np.asarray(pick_position, dtype=float)
+        self.tray_height = float(self.object_position[1])
+        self.is_attached = False
+        self.lifted = False
+        self.placed = False
+        self.is_falling = False
+        self._runtime_error_logged = False
+        self._frame_count = 0
+
+    def _to_flat_array(self, data):
+        if hasattr(data, "value"):
+            data = data.value
+        return np.array(data, dtype=float).reshape(-1)
+
+    def _tcp_position(self):
+        values = self._to_flat_array(self.tcp_mo.position)
+        if values.size < 3:
+            return None
+        return values[0:3]
+
+    def _block_position(self):
+        values = self._to_flat_array(self.block_mo.position)
+        if values.size < 3:
+            return None
+        return values[0:3]
+
+    def _set_block_position(self, xyz):
+        values = self._to_flat_array(self.block_mo.position)
+        if values.size >= 7:
+            q = values[3:7]
+        else:
+            q = np.array([0.0, 0.0, 0.0, 1.0])
+        self.block_mo.position.value = [list(np.array(xyz, dtype=float)) + list(q)]
+
+    def _get_gripper_opening(self):
+        opening_data = self.gripper_opening
+        if hasattr(opening_data, "value"):
+            opening_data = opening_data.value
+        opening_array = np.array(opening_data, dtype=float).reshape(-1)
+        if opening_array.size == 0:
+            return 0.0
+        # restLengths can be multi-valued; median is more stable than index 0.
+        return float(np.median(opening_array))
+
+    def _gripper_end_positions(self):
+        values = np.array(
+            self.gripper_mo.position.value,
+            dtype=float,
+        ).reshape(-1, 3)
+        if values.shape[0] < 2:
+            return None, None
+        return values[0], values[1]
+
+    def _grasp_point(self):
+        end_a, end_b = self._gripper_end_positions()
+        if end_a is None or end_b is None:
+            return None, None
+        return 0.5 * (end_a + end_b), _vec3_distance(end_a, end_b)
+
+    def _attach_point(self, tcp_pos, grasp_point):
+        """Prefer TCP-based pickup anchor; fall back to grasp midpoint."""
+        if tcp_pos is not None:
+            return np.array(tcp_pos, dtype=float) + self.attach_offset
+        return np.array(grasp_point, dtype=float)
+
+    def onAnimateBeginEvent(self, e):
+        _ = e
+        try:
+            self._frame_count += 1
+            elapsed = float(self.root.time.value)
+            self.root.taskElapsed.value = elapsed
+
+            tcp_pos = self._tcp_position()
+            block_pos = self._block_position()
+            if tcp_pos is None or block_pos is None:
+                print(
+                    "[P3][Evaluator] Invalid positions",
+                    "frame=",
+                    self._frame_count,
+                    "tcp=",
+                    tcp_pos,
+                    "block=",
+                    block_pos,
+                )
+                return
+
+            opening = self._get_gripper_opening()
+            grasp_point, end_distance = self._grasp_point()
+            if grasp_point is None:
+                print("[P3][Evaluator] Missing gripper end positions")
+                return
+            attach_point = self._attach_point(tcp_pos, grasp_point)
+            dist_mid = _vec3_distance(grasp_point, block_pos)
+            dist_attach = _vec3_distance(attach_point, block_pos)
+            self.root.tcpX.value = float(tcp_pos[0])
+            self.root.tcpY.value = float(tcp_pos[1])
+            self.root.tcpZ.value = float(tcp_pos[2])
+            self.root.blockX.value = float(block_pos[0])
+            self.root.blockY.value = float(block_pos[1])
+            self.root.blockZ.value = float(block_pos[2])
+            self.root.graspMidX.value = float(grasp_point[0])
+            self.root.graspMidY.value = float(grasp_point[1])
+            self.root.graspMidZ.value = float(grasp_point[2])
+            self.root.distToMidpoint.value = float(dist_mid)
+            self.root.distToAttach.value = float(dist_attach)
+            self.root.gripperOpeningForGrasp.value = float(opening)
+
+            if (not self.is_attached) and (not self.placed):
+                close_enough = dist_attach <= self.attach_distance_threshold
+                closed_enough = opening <= self.attach_opening_threshold
+
+                if close_enough and closed_enough:
+                    self.is_attached = True
+                    self.is_falling = False
+                    print(
+                        "[P3][Evaluator] ATTACH frame",
+                        self._frame_count,
+                        "opening=",
+                        round(opening, 3),
+                        "dist_attach=",
+                        round(dist_attach, 3),
+                    )
+
+            if self.is_attached:
+                self._set_block_position(attach_point)
+                block_pos = self._block_position()
+                if block_pos is None:
+                    return
+                if block_pos[1] > self.object_position[1] + self.lift_success_delta:
+                    self.lifted = True
+                    print("[P3][Evaluator] LIFTED frame", self._frame_count)
+
+                if opening > self.gripper_opening_closed:
+                    self.is_attached = False
+                    self.is_falling = True
+                    print("[P3][Evaluator] PLACED frame", self._frame_count)
+
+            elif self.is_falling:
+                fall_y = max(self.tray_height, block_pos[1] - 4.0)
+                self._set_block_position([block_pos[0], fall_y, block_pos[2]])
+                if fall_y <= self.tray_height:
+                    self.is_falling = False
+                    self.placed = True
+
+            score = 0.0
+            if self.lifted:
+                score += 50.0
+            if self.placed:
+                score += 50.0
+
+            if self.placed:
+                score += max(0.0, 20.0 - elapsed)
+
+            self.root.taskScore.value = float(score)
+            self.root.taskLifted.value = bool(self.lifted)
+            self.root.taskPlaced.value = bool(self.placed)
+        except Exception as exc:
+            if not self._runtime_error_logged:
+                Sofa.msg_error(
+                    "PickAndPlaceEvaluator",
+                    "Runtime error in evaluator: " + str(exc),
+                )
+                print("[P3][Evaluator] EXCEPTION", repr(exc))
+                traceback.print_exc()
+                self._runtime_error_logged = True
+
+
+class AutoPickAndPlaceDemo(Sofa.Core.Controller):
+
+    def __init__(
+        self,
+        root,
+        target_mo,
+        block_mo,
+        gripper_opening,
+        pick_position,
+        place_position,
+        gripper_opening_open,
+        gripper_opening_closed,
+        gripper_opening_min,
+        gripper_opening_max,
+        hover_lift_height,
+        pick_height_offset,
+        place_height_offset,
+    ):
+        Sofa.Core.Controller.__init__(self)
+        self.name = "AutoPickAndPlaceDemo"
+        self.root = root
+        self.target_mo = target_mo
+        self.block_mo = block_mo
+        self.gripper_opening = gripper_opening
+        self.pick_position = np.array(pick_position, dtype=float)
+        self.place_position = np.array(place_position, dtype=float)
+        self.opening_open = float(gripper_opening_open)
+        self.opening_closed = float(gripper_opening_closed)
+        self.opening_min = float(gripper_opening_min)
+        self.opening_max = float(gripper_opening_max)
+        self.hover_lift_height = float(hover_lift_height)
+        self.pick_height_offset = float(pick_height_offset)
+        self.place_height_offset = float(place_height_offset)
+        # mm/s limit for stable beam deformation while opening/closing
+        self.opening_rate = 45.0
+        self.demo_duration = 16.0
+        self.is_active = True
+        self.start_time = None
+        self.last_phase = None
+        print("[P3][Demo] Initialized")
+
+    def configure_positions(self, pick_position, place_position):
+        self.pick_position = np.asarray(pick_position, dtype=float)
+        self.place_position = np.asarray(place_position, dtype=float)
+
+    def reset_demo_state(self, current_time: float | None = None):
+        self.start_time = current_time
+        self.last_phase = None
+
+    def _set_target_position(self, xyz):
+        self.target_mo.position.value = [
+            [
+                float(xyz[0]),
+                float(xyz[1]),
+                float(xyz[2]),
+                0.0,
+                0.0,
+                0.0,
+                1.0,
+            ]
+        ]
+        self.root.targetX.value = float(xyz[0])
+        self.root.targetY.value = float(xyz[1])
+        self.root.targetZ.value = float(xyz[2])
+
+    def _set_gripper_opening(self, value):
+        target = float(np.clip(value, self.opening_min, self.opening_max))
+        self.root.commandedOpening.value = target
+
+        opening_data = self.gripper_opening
+
+        try:
+            if hasattr(opening_data, "value"):
+                opening_data.value = target
+            elif isinstance(opening_data, (list, tuple)):
+                # Array-like but immutable, cannot set
+                print(
+                    "[P3][Demo] WARNING: gripper_opening is immutable "
+                    f"(type={type(opening_data).__name__})"
+                )
+                return
+            else:
+                # Try slice assignment for array-like objects
+                opening_data[:] = target
+        except (TypeError, AttributeError, IndexError) as e:
+            # Silent fail - gripper_opening may be in an inconsistent state
+            print(
+                f"[P3][Demo] WARNING: failed to set gripper: {e} "
+                f"(type={type(opening_data).__name__})"
+            )
+
+    def _set_block_position(self, xyz):
+        values = self.block_mo.position.value[0]
+        if len(values) >= 7:
+            q = values[3:7]
+        else:
+            q = [0.0, 0.0, 0.0, 1.0]
+        self.block_mo.position.value = [
+            [
+                float(xyz[0]),
+                float(xyz[1]),
+                float(xyz[2]),
+                q[0],
+                q[1],
+                q[2],
+                q[3],
+            ]
+        ]
+
+    def onAnimateBeginEvent(self, e):
+        _ = e
+        if not self.is_active:
+            return
+
+        current_time = float(self.root.time.value)
+        if self.start_time is None:
+            self.start_time = current_time
+
+        elapsed = current_time - self.start_time
+
+        approach_pick = self.pick_position + np.array(
+            [0.0, self.hover_lift_height, 0.0]
+        )
+        at_pick = self.pick_position + np.array([0.0, self.pick_height_offset, 0.0])
+        lift_pick = self.pick_position + np.array([0.0, self.hover_lift_height, 0.0])
+        approach_place = self.place_position + np.array(
+            [0.0, self.hover_lift_height, 0.0]
+        )
+        at_place = self.place_position + np.array([0.0, self.place_height_offset, 0.0])
+
+        if elapsed < 2.0:
+            phase = 0
+            self._set_target_position(approach_pick)
+            self._set_gripper_opening(self.opening_open)
+        elif elapsed < 4.0:
+            phase = 1
+            self._set_target_position(at_pick)
+            self._set_gripper_opening(self.opening_open)
+        elif elapsed < 6.0:
+            phase = 2
+            self._set_target_position(at_pick)
+            self._set_gripper_opening(self.opening_closed)
+        elif elapsed < 8.0:
+            phase = 3
+            self._set_target_position(lift_pick)
+            self._set_gripper_opening(self.opening_closed)
+        elif elapsed < 10.0:
+            phase = 4
+            self._set_target_position(approach_place)
+            self._set_gripper_opening(self.opening_closed)
+        elif elapsed < 12.0:
+            phase = 5
+            self._set_target_position(at_place)
+            self._set_gripper_opening(self.opening_closed)
+        elif elapsed < 14.0:
+            phase = 6
+            self._set_target_position(at_place)
+            self._set_gripper_opening(self.opening_open)
+        elif elapsed < self.demo_duration:
+            phase = 7
+            self._set_target_position(approach_place)
+            self._set_gripper_opening(self.opening_open)
+        else:
+            self.is_active = False
+            self.root.autoDemoActive.value = False
+            print("[P3][Demo] timeline ended; manual GUI control restored")
+            return
+
+        if phase != self.last_phase:
+            self.last_phase = phase
+
+
+
+class PolicyInspectController(Sofa.Core.Controller):
+
+    def __init__(
+        self,
+        root,
+        target_mo,
+        tcp_mo,
+        block_mo,
+        gripper_state,
+        demo,
+        evaluator,
+        pick_marker_mo,
+        tuning,
+        policy_path,
+        image_shape,
+    ):
+        Sofa.Core.Controller.__init__(self)
+        self.name = "PolicyInspectController"
+        self.root = root
+        self.target_mo = target_mo
+        self.tcp_mo = tcp_mo
+        self.block_mo = block_mo
+        self.gripper_state = gripper_state
+        self.demo = demo
+        self.evaluator = evaluator
+        self.pick_marker_mo = pick_marker_mo
+        self.tuning = tuning
+        self.image_shape = tuple(image_shape)
+        self.max_steps = MAX_EPISODE_STEPS
+        self.pick_offset = (
+            np.asarray(tuning["pick_position"], dtype=float)
+            - np.asarray(tuning["object_position"], dtype=float)
+        )
+        self.place_position = np.asarray(tuning["place_position"], dtype=float)
+        self.policy_path = self._resolve_policy_path(policy_path)
+        self.policy_agent = None
+        self.handles = {
+            "root": root,
+            "demo": demo,
+            "evaluator": evaluator,
+            "target_mo": target_mo,
+            "tcp_mo": tcp_mo,
+            "block_mo": block_mo,
+            "gripper_state": gripper_state,
+            "tuning": tuning,
+        }
+        self.is_running = False
         self.phase = PHASE_NAMES[0]
         self.phase_step = 0
-        self.task_step = 0
-        self.done = False
-        self.pick_success = False
-        self.place_success = False
-        self.dropped_object = False
-        self.saved_path = None
-
-        self.prev_cube_position = self.cube_position.copy()
-        self.cube_speed = 0.0
-        self.contact_counter = 0
         self.close_counter = 0
-        self.initial_cube_y = float(self.layout.cube_position[1])
-        self.grasp_assist_active = False
-        self.grasp_offset = np.zeros(3, dtype=np.float32)
-        self.cube_quaternion = self.cube_pose[3:].astype(np.float32)
+        self.step_count = 0
+        self._start_requested_last = False
+        self._load_error_logged = False
+        self._auto_start_pending = True
+        self._last_cube_selector = None
+        root.policyCheckpointPath.value = str(self.policy_path)
+        self._load_policy()
+        self._sync_scene_to_selector(update_block=True)
 
-        self.policy_agent = None
-        if self.config.mode in {"policy", "dagger"}:
-            if not self.config.policy_path:
-                raise ValueError(f"{self.config.mode} mode requires a policy checkpoint")
-            self.policy_agent = BehaviorCloningAgent.from_checkpoint(self.config.policy_path)
+    def _resolve_policy_path(self, policy_path):
+        path = Path(policy_path)
+        return path if path.is_absolute() else (PROJECT_DIR / path)
 
-        self.recorder = None
-        if self.config.log_episode and self.config.output_dir:
-            self.recorder = EpisodeRecorder(self.config.output_dir, self.config.episode_id)
+    def _load_policy(self):
+        try:
+            from modules.imitation_policy import BehaviorCloningAgent
 
-        self.summary = None
-        self._set_effector_target(_motion_target(self.layout.cube_position, APPROACH_HEIGHT))
-        self._set_gripper_command(0.0)
-
-    @property
-    def cube_position(self) -> np.ndarray:
-        value = self.cube.getMechanicalState().position.value[0]
-        return np.asarray(value[:3], dtype=np.float32)
-
-    @property
-    def cube_pose(self) -> np.ndarray:
-        return np.asarray(self.cube.getMechanicalState().position.value[0], dtype=np.float32)
-
-    @property
-    def tcp_pose(self) -> np.ndarray:
-        return np.asarray(self.tcp.getMechanicalState().position.value[0], dtype=np.float32)
-
-    @property
-    def tcp_position(self) -> np.ndarray:
-        return self.tcp_pose[:3].astype(np.float32)
-
-    @property
-    def target_position(self) -> np.ndarray:
-        value = self.target_zone.getMechanicalState().position.value[0]
-        return np.asarray(value[:3], dtype=np.float32)
-
-    def _tip_positions(self) -> np.ndarray:
-        value = self.emio.centerpart.effector.getMechanicalState().position.value
-        return np.asarray(value, dtype=np.float32)
-
-    def _gripper_opening(self) -> float:
-        tips = self._tip_positions()
-        return float(np.linalg.norm(tips[0] - tips[1]))
-
-    def _gripper_midpoint(self) -> np.ndarray:
-        tips = self._tip_positions()
-        return np.mean(tips, axis=0).astype(np.float32)
-
-    def _contact_flag(self) -> bool:
-        midpoint = self._gripper_midpoint()
-        cube = self.cube_position
-        lateral = np.linalg.norm((cube - midpoint)[[0, 2]])
-        vertical = abs(float(cube[1] - midpoint[1]))
-        tolerance = max(CONTACT_LATERAL_TOLERANCE, 0.45 * self._gripper_opening())
-        return lateral <= tolerance and vertical <= CONTACT_VERTICAL_TOLERANCE
-
-    def _held_flag(self) -> bool:
-        if self.grasp_assist_active:
-            return True
-        if self._contact_flag():
-            return True
-        return self.pick_success and float(self.cube_position[1]) > self.initial_cube_y + 4.0
-
-    def _phase_one_hot(self) -> np.ndarray:
-        """Encode the current FSM phase so the policy knows where it is in the task."""
-
-        encoded = np.zeros(len(PHASE_NAMES), dtype=np.float32)
-        encoded[PHASE_INDEX[self.phase]] = 1.0
-        return encoded
-
-    def observation(self) -> np.ndarray:
-        """Assemble the 29-D observation vector seen by the policy.
-
-        The observation mixes absolute task state (TCP, cube, target), relative
-        geometry that makes control easier to learn, actuator state, gripper
-        state, and the current task phase.
-        """
-
-        tcp = self.tcp_position
-        cube = self.cube_position
-        target = self.target_position
-        motor_state = _read_motor_states(self.emio)
-        gripper = np.array([self._gripper_opening()], dtype=np.float32)
-        held = np.array([1.0 if self._held_flag() else 0.0], dtype=np.float32)
-
-        # This is the exact state interface used for both expert logging and
-        # learned-policy rollout, so training and inference see the same layout.
-        observation = np.concatenate(
-            [
-                tcp,
-                cube,
-                target,
-                cube - tcp,
-                target - cube,
-                motor_state,
-                gripper,
-                held,
-                self._phase_one_hot(),
-            ]
-        ).astype(np.float32)
-        if observation.shape[0] != OBSERVATION_DIM:
-            raise ValueError(f"Expected observation dim {OBSERVATION_DIM}, got {observation.shape[0]}")
-        return observation
-
-    def _set_effector_target(self, position: np.ndarray) -> None:
-        """Move the inverse-kinematics target while keeping orientation fixed."""
-
-        pose = list(position.astype(float)) + [0.0, 0.0, 0.0, 1.0]
-        self.effector_target.position.value = [pose]
-
-    def _set_gripper_command(self, command: float) -> None:
-        """Map a normalized gripper command onto the gripper opening distance."""
-
-        command = float(np.clip(command, 0.0, 1.0))
-        opening = OPENING_OPEN_MM + command * (OPENING_CLOSED_MM - OPENING_OPEN_MM)
-        self.emio.centerpart.effector.Distance.DistanceMapping.restLengths.value = [opening]
-
-    def _phase_target(self) -> np.ndarray:
-        """Return the current waypoint for the scripted finite-state expert."""
-
-        cube = self.cube_position
-        target = self.target_position
-        lookup = {
-            "approach_pick": _motion_target(cube, APPROACH_HEIGHT),
-            "descend_pick": _motion_target(cube, GRASP_HEIGHT),
-            "close_gripper": _motion_target(cube, GRASP_HEIGHT),
-            "lift": np.array([cube[0], TABLE_TOP_Y + CUBE_HALF + LIFT_HEIGHT, cube[2]], dtype=np.float32),
-            "approach_place": _motion_target(target, APPROACH_HEIGHT),
-            "descend_place": _motion_target(target, PLACE_HEIGHT),
-            "open_gripper": _motion_target(target, PLACE_HEIGHT),
-            "retreat": _motion_target(target, RETREAT_HEIGHT),
-        }
-        return lookup[self.phase]
-
-    def _set_cube_pose(self, position: np.ndarray) -> None:
-        pose = np.concatenate([position.astype(np.float32), self.cube_quaternion]).astype(float).tolist()
-        mechanical_state = self.cube.getMechanicalState()
-        mechanical_state.position.value = [pose]
-        if hasattr(mechanical_state, "velocity"):
-            mechanical_state.velocity.value = [[0.0] * 6]
-
-    def _update_grasp_assist(self) -> None:
-        """Apply a lightweight grasp assist used by this prototype.
-
-        The original goal was pure physical contact handling, but in practice
-        the inverse/contact setup became unstable enough to block data
-        collection. This helper keeps the IL pipeline runnable while preserving
-        the same observation/action interface.
-        """
-
-        opening = self._gripper_opening()
-        should_attach = (
-            not self.grasp_assist_active
-            and (
-                (
-                    self.phase in {"close_gripper", "lift", "approach_place", "descend_place"}
-                    and opening <= OPENING_SWITCH_MM
-                    and self._contact_flag()
+            if not self.policy_path.is_file():
+                raise FileNotFoundError(
+                    f"Policy checkpoint not found: {self.policy_path}. "
+                    "Use --policy-path to point at a trained checkpoint."
                 )
-                or self.phase == "lift"
-            )
+            self.policy_agent = BehaviorCloningAgent.from_checkpoint(self.policy_path)
+        except Exception as exc:
+            self.policy_agent = None
+            if not self._load_error_logged:
+                Sofa.msg_error(
+                    "PolicyInspectController",
+                    "Failed to load policy checkpoint: " + str(exc),
+                )
+                print("[P3][PolicyInspect] EXCEPTION", repr(exc))
+                traceback.print_exc()
+                self._load_error_logged = True
+
+    def _selected_object_position(self):
+        base = np.asarray(self.tuning["object_position"], dtype=float).copy()
+        base[0] = float(self.root.cubeStartX.value)
+        base[2] = float(self.root.cubeStartZ.value)
+        return base
+
+    def _selected_cube_key(self):
+        return (
+            round(float(self.root.cubeStartX.value), 4),
+            round(float(self.root.cubeStartZ.value), 4),
         )
-        if should_attach:
-            self.grasp_assist_active = True
-            self.grasp_offset = self.cube_position - self._gripper_midpoint()
 
-        should_release = self.grasp_assist_active and (
-            self.phase in {"open_gripper", "retreat"} or opening > OPENING_SWITCH_MM + 3.0
+    def _set_block_pose(self, xyz):
+        values = np.asarray(self.block_mo.position.value[0], dtype=float)
+        if values.size >= 7:
+            q = values[3:7]
+        else:
+            q = np.array([0.0, 0.0, 0.0, 1.0], dtype=float)
+        self.block_mo.position.value = [
+            [
+                float(xyz[0]),
+                float(xyz[1]),
+                float(xyz[2]),
+                float(q[0]),
+                float(q[1]),
+                float(q[2]),
+                float(q[3]),
+            ]
+        ]
+
+    def _sync_scene_to_selector(self, update_block):
+        object_position = self._selected_object_position()
+        pick_position = object_position + self.pick_offset
+        self.tuning["object_position"] = object_position.astype(np.float32)
+        self.tuning["pick_position"] = pick_position.astype(np.float32)
+        self.demo.configure_positions(pick_position, self.place_position)
+        self.evaluator.reset_task(object_position, pick_position)
+        if self.pick_marker_mo is not None:
+            self.pick_marker_mo.position.value = [list(np.asarray(pick_position, dtype=float))]
+        if update_block:
+            self._set_block_pose(object_position)
+        return object_position, pick_position
+
+    def _reset_rollout(self):
+        self._sync_scene_to_selector(update_block=True)
+        self.root.taskScore.value = 0.0
+        self.root.taskLifted.value = False
+        self.root.taskPlaced.value = False
+        self.root.autoDemoActive.value = False
+        self.phase = PHASE_NAMES[0]
+        self.phase_step = 0
+        self.close_counter = 0
+        self.step_count = 0
+        self.demo.is_active = False
+        self.demo.reset_demo_state(current_time=float(self.root.time.value))
+        self.demo._set_target_position(phase_target(self.demo, self.phase))
+        self.demo._set_gripper_opening(phase_opening(self.demo, self.phase))
+        self.is_running = True
+        self.root.policyInspectActive.value = True
+        self._auto_start_pending = False
+        self._last_cube_selector = self._selected_cube_key()
+        print(
+            "[P3][PolicyInspect] start",
+            "cube_x=",
+            round(float(self.root.cubeStartX.value), 3),
+            "cube_z=",
+            round(float(self.root.cubeStartZ.value), 3),
         )
-        if should_release:
-            self.grasp_assist_active = False
-            self.grasp_offset = np.zeros(3, dtype=np.float32)
-            release_position = self.target_position.copy()
-            self._set_cube_pose(release_position)
 
-        if self.grasp_assist_active:
-            carried_position = self._gripper_midpoint() + self.grasp_offset
-            carried_position[1] = max(carried_position[1], self.initial_cube_y)
-            self._set_cube_pose(carried_position)
+    def _stop_rollout(self, reason):
+        if self.is_running:
+            print("[P3][PolicyInspect] stop", reason)
+        self.is_running = False
+        self.root.policyInspectActive.value = False
 
-    def _expert_action(self) -> np.ndarray:
-        """Generate the scripted expert action for the current phase.
-
-        The expert follows a finite-state pick-and-place procedure, but it
-        still emits the same 4-D action interface that the learned policy uses:
-        Cartesian delta plus gripper command.
-        """
-
-        target = self._phase_target()
-        delta = _clip_delta(target - self.tcp_position)
-        gripper_command = 1.0 if self.phase in {"close_gripper", "lift", "approach_place", "descend_place"} else 0.0
-        return np.concatenate([delta, np.array([gripper_command], dtype=np.float32)]).astype(np.float32)
-
-    def _policy_action(self, observation: np.ndarray) -> np.ndarray:
-        """Query the learned policy for the next action."""
-
+    def onAnimateBeginEvent(self, _event):
         if self.policy_agent is None:
-            raise ValueError("Policy action requested without a loaded policy")
-        return np.asarray(self.policy_agent.predict(observation), dtype=np.float32)
+            self.root.policyInspectActive.value = False
+            return
 
-    def _apply_action(self, action: np.ndarray) -> np.ndarray:
-        """Clip and execute an action on the IK target and gripper."""
+        selected_cube = self._selected_cube_key()
+        slider_changed = self._last_cube_selector is not None and selected_cube != self._last_cube_selector
 
-        action = np.asarray(action, dtype=np.float32)
-        if action.shape[0] != ACTION_DIM:
-            raise ValueError(f"Expected action dim {ACTION_DIM}, got {action.shape[0]}")
+        if self._auto_start_pending and not self.is_running:
+            self._reset_rollout()
+            return
 
-        clipped_delta = _clip_delta(action[:3])
-        gripper_command = float(np.clip(action[3], 0.0, 1.0))
-
-        current_target = np.asarray(self.effector_target.position.value[0][:3], dtype=np.float32)
-        self._set_effector_target(current_target + clipped_delta)
-        self._set_gripper_command(gripper_command)
-        return np.concatenate([clipped_delta, np.array([gripper_command], dtype=np.float32)]).astype(np.float32)
-
-    def _at_waypoint(self) -> bool:
-        return float(np.linalg.norm(self._phase_target() - self.tcp_position)) <= POSE_TOLERANCE_MM
-
-    def _update_metrics(self) -> None:
-        """Update rollout metrics used for success labels and evaluation."""
-
-        self.cube_speed = float(np.linalg.norm(self.cube_position - self.prev_cube_position) / self.config.control_dt)
-        self.prev_cube_position = self.cube_position.copy()
-
-        if self._contact_flag():
-            self.contact_counter += 1
+        if not self.is_running:
+            self._sync_scene_to_selector(update_block=True)
+            self._last_cube_selector = selected_cube
+            if slider_changed:
+                self._reset_rollout()
         else:
-            self.contact_counter = 0
+            if self.step_count > 0:
+                self.phase, self.phase_step, self.close_counter, done = advance_phase(
+                    self.handles,
+                    self.phase,
+                    self.phase_step,
+                    self.close_counter,
+                )
+                if done:
+                    self._stop_rollout("completed")
+                    return
+            if self.step_count >= self.max_steps:
+                self._stop_rollout("max_steps_reached")
+                return
 
-        if not self.pick_success and float(self.cube_position[1]) > self.initial_cube_y + 8.0:
-            self.pick_success = True
+            observation = render_observation(
+                self.handles,
+                self.phase,
+                self.image_shape,
+            )
+            action = np.asarray(self.policy_agent.predict(observation), dtype=np.float32)
+            apply_policy_action(self.handles, action)
+            self.phase_step += 1
+            self.step_count += 1
 
-        distance_to_target = float(np.linalg.norm(self.cube_position - self.target_position))
-        if (
-            distance_to_target <= TARGET_RADIUS
-            and self.cube_speed <= PLACE_SPEED_TOLERANCE
-            and not self._contact_flag()
-            and self.phase in {"open_gripper", "retreat"}
-        ):
-            self.place_success = True
 
-        if self.pick_success and not self.place_success:
-            if float(self.cube_position[1]) <= self.initial_cube_y + 2.0 and self.phase in {
-                "lift",
-                "approach_place",
-                "descend_place",
-            }:
-                self.dropped_object = True
+class CameraCubeTrackerMonitor(Sofa.Core.Controller):
 
-    def _advance_phase(self) -> None:
-        """Advance the expert finite-state machine when phase conditions are met."""
+    def __init__(self, root, tracker, cube_marker_offset_mm):
+        Sofa.Core.Controller.__init__(self)
+        self.name = "CameraCubeTrackerMonitor"
+        self.root = root
+        self.tracker = tracker
+        self.cube_marker_offset_mm = np.asarray(cube_marker_offset_mm, dtype=float)
 
-        next_phase = self.phase
-        opening = self._gripper_opening()
-
-        # The FSM turns the full task into short, labeled subproblems. Those
-        # phase labels are also exposed to the policy as part of the observation.
-        if self.phase == "approach_pick" and self._at_waypoint():
-            next_phase = "descend_pick"
-        elif self.phase == "descend_pick" and self._at_waypoint():
-            next_phase = "close_gripper"
-        elif self.phase == "close_gripper":
-            self.close_counter += 1
-            if self.contact_counter >= GRASP_CONFIRM_STEPS or self.close_counter >= 15:
-                next_phase = "lift"
-        elif self.phase == "lift" and (self._at_waypoint() or self.pick_success):
-            next_phase = "approach_place"
-        elif self.phase == "approach_place" and self._at_waypoint():
-            next_phase = "descend_place"
-        elif self.phase == "descend_place" and self._at_waypoint():
-            next_phase = "open_gripper"
-        elif self.phase == "open_gripper" and (opening >= OPENING_OPEN_MM - 3.0 or self.phase_step >= 10):
-            next_phase = "retreat"
-        elif self.phase == "retreat" and self._at_waypoint():
-            self.done = True
-
-        if next_phase != self.phase:
-            self.phase = next_phase
-            self.phase_step = 0
-            if self.phase == "close_gripper":
-                self.close_counter = 0
-
-        if self.place_success and self.phase == "retreat":
-            self.done = True
-
-    def _record_step(
-        self,
-        observation: np.ndarray,
-        action: np.ndarray,
-        executed_action: np.ndarray,
-    ) -> None:
-        """Log one timestep for offline learning or later analysis."""
-
-        if self.recorder is None:
+    def onAnimateBeginEvent(self, _event):
+        if self.tracker is None or getattr(self.tracker, "mo", None) is None:
+            self.root.cameraTrackingAvailable.value = False
             return
 
-        self.recorder.append(
-            observation=observation.astype(np.float32),
-            action=action.astype(np.float32),
-            executed_action=executed_action.astype(np.float32),
-            phase_index=np.int32(PHASE_INDEX[self.phase]),
-            episode_step=np.int32(self.task_step),
-            cube_pose=self.cube_pose.astype(np.float32),
-            target_position=self.target_position.astype(np.float32),
-            effector_pose=self.tcp_pose.astype(np.float32),
-            gripper_opening=np.float32(self._gripper_opening()),
-            held_flag=np.int32(int(self._held_flag())),
-            pick_success=np.int32(int(self.pick_success)),
-            place_success=np.int32(int(self.place_success)),
-            total_success=np.int32(int(self.pick_success and self.place_success)),
-        )
-
-    def _finalize(self) -> None:
-        """Build the episode summary and optionally save the trajectory."""
-
-        if self.summary is not None:
+        points = np.asarray(self.tracker.mo.position.value, dtype=float).reshape(-1, 3)
+        if points.shape[0] < 1 or not _is_valid_tracker_xyz(points[0]):
+            self.root.cameraTrackingAvailable.value = False
             return
 
-        total_success = bool(self.pick_success and self.place_success)
-        if self.recorder is not None and (self.config.save_failed_episodes or total_success):
-            self.saved_path = self.recorder.save()
-
-        failure_phase = "completed" if total_success else self.phase
-        self.summary = {
-            "episode_id": self.config.episode_id,
-            "seed": self.config.seed,
-            "mode": self.config.mode,
-            "pick_success": bool(self.pick_success),
-            "place_success": bool(self.place_success),
-            "total_success": total_success,
-            "final_place_error_mm": float(np.linalg.norm(self.cube_position - self.target_position)),
-            "dropped_object": bool(self.dropped_object and not total_success),
-            "num_steps": self.task_step,
-            "failure_phase": failure_phase,
-            "saved_path": str(self.saved_path) if self.saved_path else None,
-        }
-
-    def onAnimateBeginEvent(self, _event) -> None:
-        """Run one control step at the start of each SOFA animation tick."""
-
-        if self.done:
-            self._finalize()
-            return
-
-        self._update_grasp_assist()
-        self._update_metrics()
-        self._advance_phase()
-
-        observation = self.observation()
-        expert_action = self._expert_action()
-
-        if self.config.mode in {"expert", "collect"}:
-            executed_action = expert_action
-            logged_action = expert_action
-        elif self.config.mode == "policy":
-            executed_action = self._policy_action(observation)
-            logged_action = executed_action
-        elif self.config.mode == "dagger":
-            # In DAgger we let the policy drive, but we store the expert action
-            # for the visited state so the dataset can teach the policy how to
-            # recover from its own mistakes.
-            executed_action = self._policy_action(observation)
-            logged_action = expert_action
-        else:
-            raise ValueError(f"Unsupported mode: {self.config.mode}")
-
-        executed_action = self._apply_action(executed_action)
-        self._record_step(observation, logged_action, executed_action)
-
-        self.task_step += 1
-        self.phase_step += 1
-        if self.task_step >= self.config.max_steps:
-            self.done = True
-            self._finalize()
-
-    def finish(self) -> dict:
-        self.done = True
-        self._finalize()
-        return self.summary
+        cube_xyz = points[0] + self.cube_marker_offset_mm
+        self.root.cameraCubeX.value = float(cube_xyz[0])
+        self.root.cameraCubeY.value = float(cube_xyz[1])
+        self.root.cameraCubeZ.value = float(cube_xyz[2])
+        self.root.cameraTrackingAvailable.value = True
 
 
-def build_scene(rootnode, config: PickPlaceTaskConfig) -> PickPlaceILController:
-    """Construct the SOFA scene for one pick-and-place rollout."""
-
+def createScene(rootnode):
+    from parts.controllers.assemblycontroller import AssemblyController
     from parts.emio import Emio
     from parts.gripper import Gripper
     from utils.header import addHeader, addSolvers
 
-    if config.mode not in MODE_CHOICES:
-        raise ValueError(f"Mode must be one of {sorted(MODE_CHOICES)}")
-
-    layout = sample_episode_layout(config.seed)
-
-    SofaRuntime.importPlugin("Sofa.Component")
-    SofaRuntime.importPlugin("Sofa.GUI.Component")
-    SofaRuntime.importPlugin("Sofa.GL.Component")
+    print("[P3][Scene] createScene start")
+    args = _parse_scene_args()
+    tuning = _default_task_tuning()
+    if _RUNTIME_TASK_TUNING:
+        tuning.update(_RUNTIME_TASK_TUNING)
 
     settings, modelling, simulation = addHeader(
         rootnode,
         inverse=True,
         withCollision=True,
     )
+    print("[P3][Scene] header added")
     settings.addObject(
         "RequiredPlugin",
-        name="pick_place_il_plugins",
-        pluginName=[
-            "Sofa.Component.Collision.Geometry",
-            "Sofa.Component.Constraint.Projective",
-            "Sofa.Component.Mapping.NonLinear",
-            "Sofa.Component.Mass",
-        ],
+        name="collision_geometry",
+        pluginName=["Sofa.Component.Collision.Geometry"],
     )
     addSolvers(simulation)
+    print("[P3][Scene] solvers added")
 
-    rootnode.dt = config.control_dt
+    rootnode.dt = 0.05
     rootnode.gravity = [0.0, -9810.0, 0.0]
     rootnode.VisualStyle.displayFlags.value = ["hideBehavior", "hideWireframe"]
+
+    rootnode.addData(name="taskScore", type="float", value=0.0)
+    rootnode.addData(name="taskElapsed", type="float", value=0.0)
+    rootnode.addData(name="taskLifted", type="bool", value=False)
+    rootnode.addData(name="taskPlaced", type="bool", value=False)
+    rootnode.addData(name="autoDemoActive", type="bool", value=True)
+    rootnode.addData(name="targetX", type="float", value=0.0)
+    rootnode.addData(name="targetY", type="float", value=0.0)
+    rootnode.addData(name="targetZ", type="float", value=0.0)
+    rootnode.addData(name="tcpX", type="float", value=0.0)
+    rootnode.addData(name="tcpY", type="float", value=0.0)
+    rootnode.addData(name="tcpZ", type="float", value=0.0)
+    rootnode.addData(name="blockX", type="float", value=0.0)
+    rootnode.addData(name="blockY", type="float", value=0.0)
+    rootnode.addData(name="blockZ", type="float", value=0.0)
+    rootnode.addData(name="graspMidX", type="float", value=0.0)
+    rootnode.addData(name="graspMidY", type="float", value=0.0)
+    rootnode.addData(name="graspMidZ", type="float", value=0.0)
+    rootnode.addData(name="distToMidpoint", type="float", value=0.0)
+    rootnode.addData(name="distToAttach", type="float", value=0.0)
+    rootnode.addData(name="gripperOpeningForGrasp", type="float", value=0.0)
+    rootnode.addData(name="commandedOpening", type="float", value=0.0)
+    rootnode.addData(name="cameraCubeX", type="float", value=0.0)
+    rootnode.addData(name="cameraCubeY", type="float", value=0.0)
+    rootnode.addData(name="cameraCubeZ", type="float", value=0.0)
+    rootnode.addData(name="cameraTrackingAvailable", type="bool", value=False)
+    rootnode.addData(name="cubeStartX", type="float", value=0.0)
+    rootnode.addData(name="cubeStartZ", type="float", value=0.0)
+    rootnode.addData(name="policyInspectActive", type="bool", value=False)
+    rootnode.addData(name="policyCheckpointPath", type="string", value="")
+    print("[P3][Scene] task data added")
 
     emio = Emio(
         name="Emio",
@@ -735,134 +852,309 @@ def build_scene(rootnode, config: PickPlaceTaskConfig) -> PickPlaceILController:
         extended=True,
     )
     if not emio.isValid():
-        raise RuntimeError("Emio scene construction failed")
+        print("[P3][Scene] emio invalid")
+        return
+    print("[P3][Scene] emio valid")
 
     simulation.addChild(emio)
     emio.attachCenterPartToLegs()
+    emio.addObject(AssemblyController(emio))
+    print("[P3][Scene] emio inserted")
+
+    if args.connection and args.camera_tracking:
+        try:
+            from parts.controllers.trackercontroller import DotTracker
+
+            camera_tracker = rootnode.addObject(
+                DotTracker(
+                    name="DotTracker",
+                    root=rootnode,
+                    configuration="extended",
+                    nb_tracker=1,
+                    show_video_feed=args.camera_preview,
+                    track_colors=True,
+                    compute_point_cloud=False,
+                    scale=1,
+                )
+            )
+            rootnode.addObject(
+                CameraCubeTrackerMonitor(
+                    root=rootnode,
+                    tracker=camera_tracker,
+                    cube_marker_offset_mm=args.cube_marker_offset_mm,
+                )
+            )
+            print("[P3][Scene] camera tracker added")
+        except Exception as exc:
+            Sofa.msg_error(__file__, "Camera not detected: " + str(exc))
+
+    # Workaround: skip gripper collision setup here because the current
+    # gripper collision helper builds a filename with a DataString + str,
+    # which crashes scene loading in this environment.
+
+    tray_mesh = _resolve_tray_mesh_path()
+    if tray_mesh is not None:
+        tray = modelling.addChild("Tray")
+        tray.addObject(
+            "MeshSTLLoader",
+            filename=tray_mesh,
+            translation=[0, 20, 0],
+        )
+        tray.addObject(
+            "OglModel",
+            src=tray.MeshSTLLoader.linkpath,
+            color=[0.3, 0.3, 0.3, 0.2],
+        )
+        print("[P3][Scene] tray added from", tray_mesh)
+    else:
+        print("[P3][Scene] WARNING: tray.stl not found; skipping tray visual")
 
     emio.effector.addObject(
         "MechanicalObject",
         template="Rigid3",
-        position=[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0] * 4,
+        position=[0, 0, 0, 0, 0, 0, 1] * 4,
     )
     emio.effector.addObject("RigidMapping", rigidIndexPerPoint=[0, 1, 2, 3])
+    print("[P3][Scene] effector added")
 
     effector_target = modelling.addChild("Target")
     effector_target.addObject("EulerImplicitSolver", firstOrder=True)
-    effector_target.addObject("CGLinearSolver", iterations=50, tolerance=1e-10, threshold=1e-10)
-    initial_target = list(_motion_target(layout.cube_position, APPROACH_HEIGHT)) + [0.0, 0.0, 0.0, 1.0]
     effector_target.addObject(
+        "CGLinearSolver",
+        iterations=50,
+        tolerance=1e-10,
+        threshold=1e-10,
+    )
+    target_mo = effector_target.addObject(
         "MechanicalObject",
         template="Rigid3",
-        position=[initial_target],
-        showObject=True,
-        showObjectScale=12,
+        position=[0, -150, 0, 0, 0, 0, 1],
+        showObject=False,
+        showObjectScale=20,
     )
+    print("[P3][Scene] target added")
 
     emio.addInverseComponentAndGUI(
         effector_target.getMechanicalState().position.linkpath,
-        withGUI=config.with_gui,
+        withGUI=MyGui is not None,
         barycentric=True,
     )
-
     tcp = modelling.addChild("TCP")
-    tcp.addObject(
+    tcp_mo = tcp.addObject(
         "MechanicalObject",
         template="Rigid3",
         position=emio.effector.EffectorCoord.barycenter.linkpath,
-        showObject=True,
-        showObjectScale=8,
     )
-
-    _build_rigid_box(
-        simulation,
-        name="Table",
-        position=np.array([0.0, TABLE_TOP_Y - TABLE_SIZE[1] / 2.0, 0.0], dtype=np.float32),
-        quaternion=np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32),
-        scale3d=TABLE_SIZE,
-        color=[0.4, 0.4, 0.45, 1.0],
-        total_mass=1.0,
-        fixed=True,
-        collision_group=0,
-    )
-
-    cube = _build_rigid_box(
-        simulation,
-        name="Cube",
-        position=layout.cube_position,
-        quaternion=layout.cube_quaternion,
-        scale3d=np.array([CUBE_SIZE, CUBE_SIZE, CUBE_SIZE], dtype=np.float32),
-        color=[0.95, 0.95, 0.95, 1.0],
-        total_mass=CUBE_MASS,
-        fixed=True,
-        collision_group=2,
-    )
-
-    target_zone = modelling.addChild("TargetZone")
-    target_zone.addObject(
-        "MechanicalObject",
-        position=[layout.target_position.tolist()],
-        showObject=True,
-        showObjectScale=TARGET_RADIUS,
-        drawMode=1,
-        showColor=[0.1, 0.9, 0.2, 1.0],
-    )
-
-    controller = PickPlaceILController(
-        emio=emio,
-        cube=cube,
-        target_zone=target_zone,
-        tcp=tcp,
-        effector_target=effector_target.getMechanicalState(),
-        layout=layout,
-        config=config,
-    )
-    rootnode.addObject(controller)
-    return controller
-
-
-def run_single_episode(config: PickPlaceTaskConfig) -> dict:
-    """Build, initialize, and roll out exactly one episode."""
-
-    root = Sofa.Core.Node("root")
-    controller = build_scene(root, config)
-    Sofa.Simulation.init(root)
-
-    max_raw_steps = config.max_steps + 300
-    raw_steps = 0
-    while not controller.done and raw_steps < max_raw_steps:
-        Sofa.Simulation.animate(root, config.control_dt)
-        raw_steps += 1
-
-    return controller.finish()
-
-
-def run_episode_batch(
-    base_config: PickPlaceTaskConfig,
-    num_episodes: int,
-    start_seed: int = 0,
-    successful_only: bool = False,
-    max_attempts: int | None = None,
-) -> list[dict]:
-    """Run multiple episodes, optionally requiring successful saves only."""
-
-    summaries = []
-    attempts = 0
-    successes = 0
-    max_attempts = max_attempts or num_episodes
-
-    while attempts < max_attempts and (successes < num_episodes if successful_only else attempts < num_episodes):
-        config = replace(
-            base_config,
-            seed=start_seed + attempts,
-            episode_id=attempts,
+    if MyGui is not None:
+        MyGui.setIPController(
+            rootnode.Modelling.Target,
+            tcp,
+            rootnode.ConstraintSolver,
         )
-        summary = run_single_episode(config)
-        summaries.append(summary)
-        if summary["total_success"]:
-            successes += 1
-        attempts += 1
-        if not successful_only and attempts >= num_episodes:
-            break
+    print("[P3][Scene] inverse + TCP added")
 
-    return summaries
+    opening_data = emio.centerpart.Effector.Distance.DistanceMapping.restLengths
+    gripper_state = emio.centerpart.Effector.getMechanicalState()
+    print("[P3][Scene] opening data bound")
+    if MyGui is not None:
+        MyGui.MoveWindow.addAccessory(
+            "Gripper's opening (mm)",
+            opening_data,
+            tuning["gripper_opening_min"],
+            tuning["gripper_opening_max"],
+        )
+        MyGui.ProgramWindow.addGripper(
+            opening_data,
+            tuning["gripper_opening_min"],
+            tuning["gripper_opening_max"],
+        )
+        MyGui.ProgramWindow.importProgram(
+            os.path.dirname(__file__) + "/mypickandplace.crprog"
+        )
+        MyGui.IOWindow.addSubscribableData("/Gripper", opening_data)
+    print("[P3][Scene] GUI controls added")
+
+    # User-tuned waypoints and object spawn pose.
+    pick_position = np.asarray(tuning["pick_position"], dtype=float).copy()
+    place_position = np.asarray(tuning["place_position"], dtype=float).copy()
+    object_position = np.asarray(tuning["object_position"], dtype=float).copy()
+    pick_offset = pick_position - object_position
+    if args.cube_x_mm is not None:
+        object_position[0] = float(args.cube_x_mm)
+    if args.cube_z_mm is not None:
+        object_position[2] = float(args.cube_z_mm)
+    pick_position = object_position + pick_offset
+    tuning["object_position"] = object_position.tolist()
+    tuning["pick_position"] = pick_position.tolist()
+    tuning["place_position"] = place_position.tolist()
+    rootnode.cubeStartX.value = float(object_position[0])
+    rootnode.cubeStartZ.value = float(object_position[2])
+    rootnode.policyCheckpointPath.value = str(
+        Path(args.policy_path) if Path(args.policy_path).is_absolute() else (PROJECT_DIR / args.policy_path)
+    )
+
+    # Keep the block kinematic for robust task evaluation.
+    block = modelling.addChild("Block")
+    block_mo = block.addObject(
+        "MechanicalObject",
+        template="Rigid3",
+        position=[
+            object_position[0],
+            object_position[1],
+            object_position[2],
+            0,
+            0,
+            0,
+            1,
+        ],
+        showObject=False,
+    )
+
+    block_visual = block.addChild("Visual")
+    block_visual.addObject(
+        "MeshOBJLoader",
+        name="loader",
+        filename=os.path.join(os.path.dirname(__file__), "cube.obj"),
+        translation=[-5.0, -32.0, 5.0],
+    )
+    block_visual.addObject("MeshTopology", src="@loader")
+    block_visual.addObject("OglModel", src="@loader", color=[0.82, 0.62, 0.25, 1.0])
+    block_visual.addObject("RigidMapping", index=0)
+
+    print("[P3][Scene] kinematic block added")
+
+    pick_marker = modelling.addChild("PickMarker")
+    pick_marker_mo = pick_marker.addObject(
+        "MechanicalObject",
+        template="Vec3",
+        position=[pick_position.tolist()],
+        showObject=False,
+        showObjectScale=8,
+        showColor=[1.0, 0.3, 0.3, 1.0],
+    )
+    place_marker = modelling.addChild("PlaceMarker")
+    place_marker.addObject(
+        "MechanicalObject",
+        template="Vec3",
+        position=[place_position],
+        showObject=False,
+        showObjectScale=8,
+        showColor=[0.3, 1.0, 0.3, 1.0],
+    )
+    print("[P3][Scene] markers added")
+
+    evaluator = PickAndPlaceEvaluator(
+        root=rootnode,
+        block_mo=block_mo,
+        tcp_mo=tcp_mo,
+        gripper_mo=gripper_state,
+        gripper_opening=opening_data,
+        object_position=object_position,
+        pick_position=pick_position,
+        place_position=place_position,
+        gripper_opening_closed=tuning["gripper_opening_closed"],
+        lift_success_delta=tuning["lift_success_delta"],
+    )
+    rootnode.addObject(evaluator)
+    print("[P3][Scene] evaluator added")
+
+    demo = AutoPickAndPlaceDemo(
+        root=rootnode,
+        target_mo=target_mo,
+        block_mo=block_mo,
+        gripper_opening=opening_data,
+        pick_position=pick_position,
+        place_position=place_position,
+        gripper_opening_open=tuning["gripper_opening_open"],
+        gripper_opening_closed=tuning["gripper_opening_closed"],
+        gripper_opening_min=tuning["gripper_opening_min"],
+        gripper_opening_max=tuning["gripper_opening_max"],
+        hover_lift_height=tuning["hover_lift_height"],
+        pick_height_offset=tuning["pick_height_offset"],
+        place_height_offset=tuning["place_height_offset"],
+    )
+    rootnode.addObject(demo)
+    print("[P3][Scene] demo path added")
+
+    if args.mode == "policy_inspect":
+        demo.is_active = False
+        rootnode.autoDemoActive.value = False
+        rootnode.addObject(
+            PolicyInspectController(
+                root=rootnode,
+                target_mo=target_mo,
+                tcp_mo=tcp_mo,
+                block_mo=block_mo,
+                gripper_state=gripper_state,
+                demo=demo,
+                evaluator=evaluator,
+                pick_marker_mo=pick_marker_mo,
+                tuning=tuning,
+                policy_path=args.policy_path,
+                image_shape=default_image_shape(),
+            )
+        )
+        print("[P3][Scene] policy inspect controller added")
+
+    if MyGui is not None:
+        MyGui.MyRobotWindow.addInformation("Task score", rootnode.taskScore)
+        MyGui.MyRobotWindow.addInformation("Task lifted", rootnode.taskLifted)
+        MyGui.MyRobotWindow.addInformation("Task placed", rootnode.taskPlaced)
+        MyGui.MyRobotWindow.addInformation(
+            "Auto demo active",
+            rootnode.autoDemoActive,
+        )
+        MyGui.MyRobotWindow.addInformation(
+            "Task elapsed (s)",
+            rootnode.taskElapsed,
+        )
+        MyGui.PlottingWindow.addData("tcp x", rootnode.tcpX)
+        MyGui.PlottingWindow.addData("tcp y", rootnode.tcpY)
+        MyGui.PlottingWindow.addData("tcp z", rootnode.tcpZ)
+        MyGui.PlottingWindow.addData("block x", rootnode.blockX)
+        MyGui.PlottingWindow.addData("block y", rootnode.blockY)
+        MyGui.PlottingWindow.addData("block z", rootnode.blockZ)
+        MyGui.PlottingWindow.addData("grasp midpoint x", rootnode.graspMidX)
+        MyGui.PlottingWindow.addData("grasp midpoint y", rootnode.graspMidY)
+        MyGui.PlottingWindow.addData("grasp midpoint z", rootnode.graspMidZ)
+        MyGui.PlottingWindow.addData(
+            "diag distance block-midpoint",
+            rootnode.distToMidpoint,
+        )
+        MyGui.PlottingWindow.addData(
+            "diag distance block-attach",
+            rootnode.distToAttach,
+        )
+        MyGui.PlottingWindow.addData(
+            "diag gripper opening (GUI)",
+            rootnode.gripperOpeningForGrasp,
+        )
+        MyGui.PlottingWindow.addData(
+            "diag gripper opening command",
+            rootnode.commandedOpening,
+        )
+        MyGui.MyRobotWindow.addInformation(
+            "Camera tracking available",
+            rootnode.cameraTrackingAvailable,
+        )
+        MyGui.PlottingWindow.addData("camera cube x", rootnode.cameraCubeX)
+        MyGui.PlottingWindow.addData("camera cube y", rootnode.cameraCubeY)
+        MyGui.PlottingWindow.addData("camera cube z", rootnode.cameraCubeZ)
+        if args.mode == "policy_inspect":
+            MyGui.MoveWindow.addAccessory("Cube start X (mm)", rootnode.cubeStartX, -95.0, 95.0)
+            MyGui.MoveWindow.addAccessory("Cube start Z (mm)", rootnode.cubeStartZ, -95.0, 95.0)
+            MyGui.MyRobotWindow.addInformation(
+                "Policy inspect active",
+                rootnode.policyInspectActive,
+            )
+            MyGui.IOWindow.addSubscribableData("/PolicyInspect/Active", rootnode.policyInspectActive)
+            MyGui.IOWindow.addSubscribableData("/PolicyInspect/CubeStartX", rootnode.cubeStartX)
+            MyGui.IOWindow.addSubscribableData("/PolicyInspect/CubeStartZ", rootnode.cubeStartZ)
+    print("[P3][Scene] info fields added")
+
+    if args.connection:
+        emio.addConnectionComponents()
+        print("[P3][Scene] connection components added")
+
+    print("[P3][Scene] createScene complete")
+    return rootnode

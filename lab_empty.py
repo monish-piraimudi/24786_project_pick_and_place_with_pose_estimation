@@ -15,7 +15,7 @@ from modules.pick_place_scene_entry import create_pick_place_scene
 
 
 def createScene(rootnode):
-    return create_pick_place_scene(rootnode)
+    return create_pick_place_scene(rootnode, argv=["--no-connection", "--no-camera-tracking"])
 
 
 if __name__ == "__main__":

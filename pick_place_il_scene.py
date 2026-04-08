@@ -11,7 +11,7 @@ PROJECT_DIR_STR = str(PROJECT_DIR)
 if PROJECT_DIR_STR not in sys.path:
     sys.path.insert(0, PROJECT_DIR_STR)
 
-from modules.pick_place_scene_entry import create_pick_place_scene
+from modules.pick_place_il import createScene as create_pick_place_scene
 
 
 def createScene(rootnode):

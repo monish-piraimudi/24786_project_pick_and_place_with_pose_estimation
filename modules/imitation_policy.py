@@ -1,9 +1,4 @@
-"""Behavior-cloning policy helpers for the Emio pick-and-place task.
-
-This module is the "learned policy" side of the imitation-learning pipeline:
-we define a small neural network, save the normalization statistics it needs,
-and load the checkpoint back for closed-loop rollouts inside SOFA.
-"""
+"""Behavior-cloning helpers for the image-based pick-and-place policy."""
 
 from __future__ import annotations
 
@@ -13,51 +8,55 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from modules.camera_observation import default_image_shape
 
-OBSERVATION_DIM = 29
+
 ACTION_DIM = 4
 
 
-class BehaviorCloningMLP(nn.Module):
-    """Small MLP used for behavior cloning.
+class BehaviorCloningCNN(nn.Module):
+    """Compact CNN used for image-based behavior cloning."""
 
-    In behavior cloning, the network is trained on logged expert
-    state-action pairs and learns to predict the action that the expert would
-    take from the current observation.
-    """
-
-    def __init__(self, input_dim: int = OBSERVATION_DIM, output_dim: int = ACTION_DIM):
+    def __init__(self, input_channels: int = 3, output_dim: int = ACTION_DIM):
         super().__init__()
-        self.network = nn.Sequential(
-            nn.Linear(input_dim, 128),
+        self.features = nn.Sequential(
+            nn.Conv2d(input_channels, 32, kernel_size=5, stride=2, padding=2),
             nn.ReLU(),
+            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool2d((1, 1)),
+        )
+        self.head = nn.Sequential(
+            nn.Flatten(),
             nn.Linear(128, 128),
             nn.ReLU(),
             nn.Linear(128, output_dim),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.network(x)
+        return self.head(self.features(x))
 
 
 def save_policy_checkpoint(
     file_path: str | Path,
-    model: BehaviorCloningMLP,
-    obs_mean: np.ndarray,
-    obs_std: np.ndarray,
+    model: BehaviorCloningCNN,
+    image_mean: np.ndarray,
+    image_std: np.ndarray,
+    image_shape: tuple[int, int, int] | None = None,
     metadata: dict | None = None,
 ) -> None:
-    """Save the trained policy together with observation normalization stats."""
+    """Save the trained CNN together with image normalization stats."""
 
     file_path = Path(file_path)
     file_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
             "state_dict": model.state_dict(),
-            # The policy was trained on normalized observations, so rollout code
-            # must reuse the same mean/std at inference time.
-            "obs_mean": np.asarray(obs_mean, dtype=np.float32),
-            "obs_std": np.asarray(obs_std, dtype=np.float32),
+            "image_mean": np.asarray(image_mean, dtype=np.float32),
+            "image_std": np.asarray(image_std, dtype=np.float32),
+            "image_shape": tuple(image_shape or default_image_shape()),
             "metadata": metadata or {},
         },
         file_path,
@@ -67,34 +66,37 @@ def save_policy_checkpoint(
 def load_policy_checkpoint(
     file_path: str | Path,
     device: str | torch.device = "cpu",
-) -> tuple[BehaviorCloningMLP, np.ndarray, np.ndarray, dict]:
-    """Load a trained policy and the statistics needed to preprocess inputs."""
+) -> tuple[BehaviorCloningCNN, np.ndarray, np.ndarray, tuple[int, int, int], dict]:
+    """Load a trained image policy and its preprocessing metadata."""
 
     checkpoint = torch.load(file_path, map_location=device, weights_only=False)
-    model = BehaviorCloningMLP()
+    image_shape = tuple(checkpoint.get("image_shape") or default_image_shape())
+    model = BehaviorCloningCNN(input_channels=int(image_shape[2]))
     model.load_state_dict(checkpoint["state_dict"])
     model.to(device)
     model.eval()
 
-    obs_mean = np.asarray(checkpoint["obs_mean"], dtype=np.float32)
-    obs_std = np.asarray(checkpoint["obs_std"], dtype=np.float32)
+    image_mean = np.asarray(checkpoint["image_mean"], dtype=np.float32)
+    image_std = np.asarray(checkpoint["image_std"], dtype=np.float32)
     metadata = dict(checkpoint.get("metadata", {}))
-    return model, obs_mean, obs_std, metadata
+    return model, image_mean, image_std, image_shape, metadata
 
 
 class BehaviorCloningAgent:
-    """Thin inference wrapper used by the SOFA controller during rollouts."""
+    """Thin image-policy inference wrapper used by the SOFA controller."""
 
     def __init__(
         self,
-        model: BehaviorCloningMLP,
-        obs_mean: np.ndarray,
-        obs_std: np.ndarray,
+        model: BehaviorCloningCNN,
+        image_mean: np.ndarray,
+        image_std: np.ndarray,
+        image_shape: tuple[int, int, int] | None = None,
         device: str | torch.device = "cpu",
     ):
         self.model = model
-        self.obs_mean = np.asarray(obs_mean, dtype=np.float32)
-        self.obs_std = np.asarray(obs_std, dtype=np.float32)
+        self.image_mean = np.asarray(image_mean, dtype=np.float32)
+        self.image_std = np.asarray(image_std, dtype=np.float32)
+        self.image_shape = tuple(image_shape or default_image_shape())
         self.device = torch.device(device)
         self.model.to(self.device)
         self.model.eval()
@@ -105,22 +107,28 @@ class BehaviorCloningAgent:
         file_path: str | Path,
         device: str | torch.device = "cpu",
     ) -> "BehaviorCloningAgent":
-        """Construct an inference agent from a saved behavior-cloning checkpoint."""
-
-        model, obs_mean, obs_std, _ = load_policy_checkpoint(file_path, device=device)
-        return cls(model=model, obs_mean=obs_mean, obs_std=obs_std, device=device)
+        model, image_mean, image_std, image_shape, _metadata = load_policy_checkpoint(file_path, device=device)
+        return cls(
+            model=model,
+            image_mean=image_mean,
+            image_std=image_std,
+            image_shape=image_shape,
+            device=device,
+        )
 
     def predict(self, observation: np.ndarray) -> np.ndarray:
-        """Predict a single action for one observation vector.
+        """Predict a single action from one RGB image observation."""
 
-        The observation mixes positions, motor states, and phase indicators
-        that live on different numeric scales, so we normalize it exactly the
-        same way it was normalized during training before passing it to the MLP.
-        """
-
-        observation = np.asarray(observation, dtype=np.float32)
-        normalized = (observation - self.obs_mean) / self.obs_std
+        image = np.asarray(observation, dtype=np.float32)
+        if image.ndim != 3:
+            raise ValueError(f"Expected HWC image observation, got shape {image.shape}")
+        if tuple(image.shape) != self.image_shape:
+            raise ValueError(f"Expected image shape {self.image_shape}, got {tuple(image.shape)}")
+        if float(np.max(image)) > 1.5:
+            image = image / 255.0
+        image = (image - self.image_mean.reshape(1, 1, -1)) / self.image_std.reshape(1, 1, -1)
+        image = np.transpose(image, (2, 0, 1)).astype(np.float32)
         with torch.inference_mode():
-            tensor = torch.from_numpy(normalized).to(self.device).unsqueeze(0)
+            tensor = torch.from_numpy(image).to(self.device).unsqueeze(0)
             action = self.model(tensor).cpu().numpy()[0]
         return action.astype(np.float32)
