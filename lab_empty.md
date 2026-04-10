@@ -6,11 +6,11 @@ This lab uses the Emio pick-and-place scene as the source of truth for the full 
 
 The workflow is:
 - watch the scripted expert in SOFA
-- collect randomized expert episodes from that same scene
-- train a behavior-cloning CNN on saved RGB observations
+- collect successful expert episodes from that same scene
+- train an implicit behavior-cloning policy on saved RGB observations
 - evaluate the learned policy in closed loop
 
-The task is simulation-only. The saved policy input is a compact rendered RGB observation, and the expert target is a 4D action:
+The deployed policy is image-based. It consumes real RGB observations from the Emio camera and predicts a 4D action by minimizing an energy model over observation-action pairs:
 - `dx`
 - `dy`
 - `dz`
@@ -50,7 +50,7 @@ SOFA-based collection and evaluation scripts must run with SOFA's Python 3.10 in
 Open these files and identify their roles:
 - `modules/pick_place_il.py`
 - `modules/pick_place_il_runtime.py`
-- `modules/camera_observation.py`
+- `modules/emio_camera_observation.py`
 - `modules/imitation_data.py`
 - `modules/imitation_policy.py`
 
@@ -70,18 +70,20 @@ The current pipeline is split across a few small modules:
 - `modules/pick_place_il.py`
   Defines the SOFA scene, the evaluator, the tuned task parameters, and the scripted `AutoPickAndPlaceDemo`.
 - `modules/pick_place_il_runtime.py`
-  Builds that exact scene headlessly, applies randomized initial conditions, records episodes, and runs learned-policy rollouts.
+  Builds that exact scene headlessly, samples tray-wide object poses, records episodes, and runs learned-policy rollouts.
+- `modules/emio_camera_observation.py`
+  Opens `EmioCamera`, updates frames and trackers, and provides real RGB observations plus tracker positions.
 - `modules/camera_observation.py`
-  Renders the synthetic RGB observation used by training and inference.
+  Provides a synthetic fallback observation path for debugging when real RGB is disabled.
 - `modules/imitation_data.py`
   Saves episodes, loads datasets, splits by episode, and computes rollout metrics.
 - `modules/imitation_policy.py`
-  Defines the CNN policy and checkpoint save/load helpers.
+  Defines the implicit BC energy model, action search, and checkpoint save/load helpers.
 
 The scene is the source of truth. The runtime scripts do not define a separate task; they only drive the scene for:
 - collection
 - evaluation
-- image rendering
+- observation capture
 - logging
 
 ::: exercise
@@ -139,20 +141,22 @@ Watch one full expert rollout in SOFA and describe what happens in each of the e
 `collect_il_dataset.py` runs the pick-and-place scene headlessly and records successful expert episodes.
 
 The saved episodes come from the scene's own timed demo. For each seed:
-- the block spawn is jittered in X/Z
+- the block spawn is sampled from a continuous tray workspace in X/Z
+- the pick location uses the same X/Z as the block
 - the place target stays fixed by default
-- the pick waypoint is derived from the jittered block pose
-- the script records RGB observations and expert 4D actions at each step
+- the script records real RGB camera observations, expert 4D actions, executed actions, and tracker-assisted cube metadata at each step
 
-By default:
-- `object_jitter_mm = 15`
-- `place_jitter_mm = 0`
+By default the workspace bounds are:
+- `x in [-35, 10]`
+- `z in [-30, 20]`
 
-Set both to `0` if you want the untuned base layout with no randomization. If you want more pickup diversity while keeping placement fixed, increase only `object_jitter_mm`.
+The default collection path is camera-free so it can run without attached hardware. When a camera is connected, enable live RGB observations and marker-assisted tracking explicitly with:
+- `--real-rgb-observation`
+- `--camera-tracking`
 
 Collect a starter dataset:
 
-#python-button("assets/labs/24786_project_pick_and_place_with_pose_estimation/collect_il_dataset.py --episodes 100 --max-attempts 40 --object-jitter-mm 15 --place-jitter-mm 0 --save-failed-episodes")
+#python-button("assets/labs/24786_project_pick_and_place_with_pose_estimation/collect_il_dataset.py --episodes 100 --max-attempts 140 --workspace-bounds-mm -35 10 -30 20 --save-failed-episodes")
 
 Recommended manual command:
 
@@ -160,10 +164,16 @@ Recommended manual command:
 /opt/emio-labs/resources/sofa/bin/python/bin/python3.10 \
   assets/labs/24786_project_pick_and_place_with_pose_estimation/collect_il_dataset.py \
   --episodes 100 \
-  --max-attempts 40 \
-  --object-jitter-mm 15 \
-  --place-jitter-mm 0 \
+  --max-attempts 140 \
+  --workspace-bounds-mm -35 10 -30 20 \
   --save-failed-episodes
+```
+
+To collect with the physical camera attached, add:
+
+```bash
+  --real-rgb-observation \
+  --camera-tracking
 ```
 
 Saved outputs:
@@ -188,6 +198,7 @@ Important saved keys include:
 - `observation`
 - `action`
 - `executed_action`
+- `tracked_cube_position`
 - `phase_index`
 - `episode_step`
 - `cube_pose`
@@ -206,6 +217,8 @@ Important saved keys include:
 For learning:
 - policy input is `observation`
 - training target is `action`
+
+In this version of the lab, `observation` is expected to be an RGB image with shape `[N, H, W, 3]`, typically coming from the Emio camera.
 
 In `modules/imitation_data.py`:
 - `EpisodeRecorder` stores one rollout
@@ -233,12 +246,12 @@ Inspect one saved `.npz` file and answer:
 :::: collapse Step 4: Train The Image Policy
 ## Step 4: Train The Image Policy
 
-`train_il_policy.py` trains a convolutional behavior-cloning model from the saved episodes.
+`train_il_policy.py` trains an implicit behavior-cloning policy from the saved episodes.
 
 With the default collection settings, the learned policy sees image observations from:
 - varying pickup locations
 - one fixed placement target
-- the same rendered RGB observation format at every timestep
+- the same real RGB camera observation format at every timestep
 
 Training expects the newly saved image episodes from this lab folder. If the dataset directory contains old legacy vector episodes mixed with image episodes, training now stops with a clear error instead of silently skipping them.
 
@@ -247,12 +260,13 @@ The training script:
 - splits them into train, validation, and test episodes
 - flattens each split into stepwise arrays
 - normalizes RGB observations channel-wise
-- trains the CNN with mean-squared error
+- trains an energy model on positive expert actions plus sampled negative actions
 - saves the checkpoint with image normalization statistics
 
-The current policy in `modules/imitation_policy.py` is image-only:
+The current policy in `modules/imitation_policy.py` is image-only and implicit:
 - input shape `[H, W, 3]`
-- output dimension `4`
+- action dimension `4`
+- inference selects the action with minimum predicted energy over a bounded search distribution
 
 Train the policy:
 
@@ -272,7 +286,7 @@ Output:
 ::: exercise
 **Exercise:**
 
-Run training and inspect the printed losses. Why must the exact same image normalization be reused at inference time?
+Run training and inspect the printed losses. Why must the exact same image normalization and action bounds be reused at inference time?
 
 :::
 
@@ -297,7 +311,7 @@ Useful metrics include:
 
 Evaluate the learned policy:
 
-#python-button("assets/labs/24786_project_pick_and_place_with_pose_estimation/evaluate_il_policy.py --mode policy --policy-path data/results/il_pick_place/bc_policy.pth")
+#python-button("assets/labs/24786_project_pick_and_place_with_pose_estimation/evaluate_il_policy.py --mode policy --policy-path data/results/il_pick_place/bc_policy.pth --workspace-bounds-mm -35 10 -30 20")
 
 Recommended manual command:
 
@@ -305,12 +319,21 @@ Recommended manual command:
 /opt/emio-labs/resources/sofa/bin/python/bin/python3.10 \
   assets/labs/24786_project_pick_and_place_with_pose_estimation/evaluate_il_policy.py \
   --mode policy \
-  --policy-path data/results/il_pick_place/bc_policy.pth
+  --policy-path data/results/il_pick_place/bc_policy.pth \
+  --workspace-bounds-mm -35 10 -30 20
 ```
 
 Saved outputs:
 - `data/results/il_pick_place/eval/rollout_manifest.json`
 - `data/results/il_pick_place/eval/metrics.json`
+
+By default evaluation uses:
+- synthetic observations and no tracker, so it can run without attached hardware
+- the same fixed place target used during collection
+
+To evaluate with the camera attached, add:
+- `--real-rgb-observation`
+- `--camera-tracking`
 
 ::: exercise
 **Exercise:**
@@ -324,16 +347,19 @@ Compare policy evaluation metrics to the expert baseline. If the learned policy 
 :::: collapse Step 6: Compare Expert And Policy
 ## Step 6: Compare Expert And Policy
 
-Step 6 now supports an interactive GUI policy-inspection mode inside the same SOFA scene.
+Step 6 now supports two interactive GUI policy-inspection modes inside the same SOFA scene:
+- a default inspection scene that does not require camera hardware
+- an optional live-camera inspection scene for real RGB policy input
 
 The recommended comparison flow is:
 1. watch the scripted expert in the default GUI scene
-2. launch the scene in `policy_inspect` mode with a trained checkpoint
-3. choose cube `x/z` positions with the GUI controls
-4. watch one learned-policy rollout start automatically
-5. compare that visual behavior to the scripted evaluation metrics
+2. launch the default policy-inspection scene with a trained checkpoint
+3. inspect the learned rollout without requiring a camera
+4. if a camera is attached, launch the live-camera inspection scene
+5. move the cube within the tray workspace while the camera sees it
+6. compare that visual behavior to the scripted evaluation metrics
 
-Use the `runSofa` button below to open the interactive learned-policy scene in Emio:
+Use the default `runSofa` button below to open the camera-free learned-policy scene in Emio:
 
 #runsofa-button("assets/labs/24786_project_pick_and_place_with_pose_estimation/policy_inspect_scene.py")
 
@@ -342,11 +368,28 @@ Use the `runSofa` button below to open the interactive learned-policy scene in E
   assets/labs/24786_project_pick_and_place_with_pose_estimation/policy_inspect_scene.py
 ```
 
-Inside the GUI:
-- use `Cube start X (mm)` and `Cube start Z (mm)` to choose the initial cube pose
+This default scene:
+- does not require an attached Emio camera
+- uses the synthetic fallback observation path
+- keeps the place target fixed
+- starts the learned-policy rollout automatically when the scene opens
+- lets you move the cube in the scene and rerun after each rollout
+
+If you have a camera attached and want live RGB policy input, use this second scene:
+
+#runsofa-button("assets/labs/24786_project_pick_and_place_with_pose_estimation/policy_inspect_camera_scene.py")
+
+```bash
+/opt/emio-labs/resources/sofa/bin/runSofa -a \
+  assets/labs/24786_project_pick_and_place_with_pose_estimation/policy_inspect_camera_scene.py
+```
+
+Inside the live-camera GUI:
 - keep the place target fixed
 - the learned-policy rollout starts automatically when the scene opens
-- after the rollout finishes, adjust the cube position to trigger another trial automatically
+- the policy consumes live RGB frames from the Emio camera
+- tracker updates are used to align the cube pose and diagnostics with the observed object
+- after the rollout finishes, move the cube to a new tray position to trigger another trial automatically
 
 Scripted evaluation is still useful for aggregate metrics. Example expert evaluation:
 
@@ -372,7 +415,7 @@ Example policy evaluation on the same seeds:
 ::: exercise
 **Exercise:**
 
-Open the GUI in `policy_inspect` mode and test at least three different cube `x/z` positions. Which pickup offsets does the learned policy handle well, and where does it diverge from the scripted expert?
+Open the default GUI policy-inspection scene and test at least three different cube `x/z` positions. If a camera is attached, repeat the same test in the live-camera scene. Which pickup offsets does the learned policy handle well, and where does it diverge from the scripted expert?
 
 :::
 
@@ -384,20 +427,20 @@ Open the GUI in `policy_inspect` mode and test at least three different cube `x/
 In this lab you:
 - inspected the pick-and-place scene in SOFA
 - used that exact scene to generate imitation-learning episodes
-- trained an image-based behavior-cloning policy
+- trained an image-based implicit behavior-cloning policy
 - evaluated the learned controller in closed loop
 - compared expert and learned rollout performance
 
 The key idea is that one scene drives the whole pipeline:
 - scene definition in `modules/pick_place_il.py`
 - runtime collection and evaluation in `modules/pick_place_il_runtime.py`
-- image rendering in `modules/camera_observation.py`
+- real RGB observation capture in `modules/emio_camera_observation.py`
 - offline training in `train_il_policy.py`
 
 From here, you can experiment with:
 - more demonstrations
-- more jitter
-- different CNN architectures
-- richer synthetic camera observations
+- wider workspace bounds
+- different implicit-policy search hyperparameters
+- stronger image encoders
 
 ::::

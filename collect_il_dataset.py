@@ -3,14 +3,14 @@ from dataclasses import replace
 from pathlib import Path
 
 from modules.imitation_data import aggregate_rollout_metrics, ensure_directory, write_manifest
-from modules.pick_place_il_runtime import PickPlaceTaskConfig, run_single_episode
+from modules.pick_place_il_runtime import DEFAULT_WORKSPACE_BOUNDS_MM, PickPlaceTaskConfig, run_single_episode
 
 
 PROJECT_DIR = Path(__file__).resolve().parent
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Collect imitation-learning episodes for Emio pick and place")
+    parser = argparse.ArgumentParser(description="Collect implicit-BC episodes for Emio pick and place")
     parser.add_argument("--episodes", type=int, default=200, help="Number of successful episodes to save")
     parser.add_argument("--start-seed", type=int, default=0, help="Seed used for the first attempted episode")
     parser.add_argument(
@@ -31,17 +31,70 @@ def main():
         help="Also persist failed rollouts instead of only successful ones",
     )
     parser.add_argument(
-        "--object-jitter-mm",
-        type=float,
-        default=15.0,
-        help="Random X/Z jitter applied to the spawned block position",
+        "--connection",
+        action="store_true",
+        help="Enable the real robot connection components in the scene while collecting.",
     )
     parser.add_argument(
-        "--place-jitter-mm",
-        type=float,
-        default=0.0,
-        help="Random X/Z jitter applied to the place target position. Default keeps the place target fixed.",
+        "--camera-preview",
+        action="store_true",
+        help="Show the Emio camera preview while collecting.",
     )
+    parser.add_argument(
+        "--real-rgb-observation",
+        dest="real_rgb_observation",
+        action="store_true",
+        help="Use live Emio camera RGB frames as the saved observation source.",
+    )
+    parser.add_argument(
+        "--no-real-rgb-observation",
+        dest="real_rgb_observation",
+        action="store_false",
+        help="Disable real RGB camera observations and fall back to the synthetic render.",
+    )
+    parser.add_argument(
+        "--camera-tracking",
+        dest="camera_tracking",
+        action="store_true",
+        help="Enable marker-assisted cube tracking during collection.",
+    )
+    parser.add_argument(
+        "--no-camera-tracking",
+        dest="camera_tracking",
+        action="store_false",
+        help="Disable marker-assisted cube tracking during collection.",
+    )
+    parser.add_argument(
+        "--camera-serial",
+        type=str,
+        default=None,
+        help="Optional Emio camera serial to open explicitly.",
+    )
+    parser.add_argument(
+        "--cube-marker-offset-mm",
+        type=float,
+        nargs=3,
+        metavar=("X", "Y", "Z"),
+        default=(0.0, 0.0, 0.0),
+        help="Fixed XYZ offset from the tracked cube marker to the cube center in millimeters.",
+    )
+    parser.add_argument(
+        "--workspace-bounds-mm",
+        type=float,
+        nargs=4,
+        metavar=("X_MIN", "X_MAX", "Z_MIN", "Z_MAX"),
+        default=DEFAULT_WORKSPACE_BOUNDS_MM,
+        help="Continuous tray workspace bounds used to sample object X/Z positions.",
+    )
+    parser.add_argument(
+        "--place-target-mm",
+        type=float,
+        nargs=3,
+        metavar=("X", "Y", "Z"),
+        default=None,
+        help="Optional fixed place target override in millimeters.",
+    )
+    parser.set_defaults(real_rgb_observation=False, camera_tracking=False)
     args = parser.parse_args()
 
     output_dir_arg = Path(args.output_dir)
@@ -55,8 +108,14 @@ def main():
         output_dir=str(output_dir),
         log_episode=True,
         save_failed_episodes=args.save_failed_episodes,
-        object_jitter_mm=args.object_jitter_mm,
-        place_jitter_mm=args.place_jitter_mm,
+        connection=args.connection,
+        camera_tracking=args.camera_tracking,
+        camera_preview=args.camera_preview,
+        real_rgb_observation=args.real_rgb_observation,
+        camera_serial=args.camera_serial,
+        object_workspace_bounds_mm=tuple(float(v) for v in args.workspace_bounds_mm),
+        place_target_mm=None if args.place_target_mm is None else tuple(float(v) for v in args.place_target_mm),
+        cube_marker_offset_mm=tuple(float(v) for v in args.cube_marker_offset_mm),
     )
 
     saved_entries = []

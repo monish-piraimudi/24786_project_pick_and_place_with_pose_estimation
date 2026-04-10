@@ -4,11 +4,18 @@ from dataclasses import replace
 from pathlib import Path
 
 from modules.imitation_data import aggregate_rollout_metrics, ensure_directory, write_manifest
-from modules.pick_place_il_runtime import PickPlaceTaskConfig, run_single_episode
+from modules.pick_place_il_runtime import DEFAULT_WORKSPACE_BOUNDS_MM, PickPlaceTaskConfig, run_single_episode
+
+
+PROJECT_DIR = Path(__file__).resolve().parent
+
+
+def _resolve_project_path(path: Path) -> Path:
+    return path if path.is_absolute() else (PROJECT_DIR / path)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Evaluate expert or learned Emio pick-and-place controller")
+    parser = argparse.ArgumentParser(description="Evaluate expert or implicit learned Emio pick-and-place controller")
     parser.add_argument(
         "--mode",
         choices=["expert", "policy"],
@@ -21,8 +28,8 @@ def main():
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("data/results/il_pick_place/eval"),
-        help="Directory for evaluation manifests and optional episodes",
+        default=PROJECT_DIR / "data/results/il_pick_place/eval",
+        help="Directory for evaluation manifests and optional episodes. Relative paths are resolved from this lab folder.",
     )
     parser.add_argument(
         "--save-rollouts",
@@ -35,14 +42,39 @@ def main():
         help="Enable the real robot connection components in the scene",
     )
     parser.add_argument(
-        "--camera-tracking",
-        action="store_true",
-        help="Use Emio camera tracking to localize the cube marker during rollouts",
-    )
-    parser.add_argument(
         "--camera-preview",
         action="store_true",
         help="Show the Emio camera preview feed when camera tracking is enabled",
+    )
+    parser.add_argument(
+        "--real-rgb-observation",
+        dest="real_rgb_observation",
+        action="store_true",
+        help="Use live Emio camera RGB frames as the policy observation source.",
+    )
+    parser.add_argument(
+        "--no-real-rgb-observation",
+        dest="real_rgb_observation",
+        action="store_false",
+        help="Disable real RGB camera observations and fall back to the synthetic render.",
+    )
+    parser.add_argument(
+        "--camera-tracking",
+        dest="camera_tracking",
+        action="store_true",
+        help="Enable marker-assisted cube tracking during rollouts.",
+    )
+    parser.add_argument(
+        "--no-camera-tracking",
+        dest="camera_tracking",
+        action="store_false",
+        help="Disable marker-assisted cube tracking during rollouts.",
+    )
+    parser.add_argument(
+        "--camera-serial",
+        type=str,
+        default=None,
+        help="Optional Emio camera serial to open explicitly.",
     )
     parser.add_argument(
         "--cube-marker-offset-mm",
@@ -53,23 +85,28 @@ def main():
         help="Fixed XYZ offset from the tracked cube marker to the cube center in millimeters",
     )
     parser.add_argument(
-        "--object-jitter-mm",
+        "--workspace-bounds-mm",
         type=float,
-        default=15.0,
-        help="Random X/Z jitter applied to the spawned block position",
+        nargs=4,
+        metavar=("X_MIN", "X_MAX", "Z_MIN", "Z_MAX"),
+        default=DEFAULT_WORKSPACE_BOUNDS_MM,
+        help="Continuous tray workspace bounds used to sample object X/Z positions.",
     )
     parser.add_argument(
-        "--place-jitter-mm",
+        "--place-target-mm",
         type=float,
-        default=0.0,
-        help="Random X/Z jitter applied to the place target position. Default keeps the place target fixed.",
+        nargs=3,
+        metavar=("X", "Y", "Z"),
+        default=None,
+        help="Optional fixed place target override in millimeters.",
     )
+    parser.set_defaults(real_rgb_observation=False, camera_tracking=False)
     args = parser.parse_args()
 
     if args.mode == "policy" and not args.policy_path:
         raise SystemExit("--policy-path is required when --mode policy is used")
 
-    output_dir = ensure_directory(args.output_dir)
+    output_dir = ensure_directory(_resolve_project_path(Path(args.output_dir)))
     base_config = PickPlaceTaskConfig(
         mode=args.mode,
         policy_path=args.policy_path,
@@ -79,9 +116,11 @@ def main():
         connection=args.connection,
         camera_tracking=args.camera_tracking,
         camera_preview=args.camera_preview,
+        real_rgb_observation=args.real_rgb_observation,
+        camera_serial=args.camera_serial,
         cube_marker_offset_mm=tuple(float(value) for value in args.cube_marker_offset_mm),
-        object_jitter_mm=args.object_jitter_mm,
-        place_jitter_mm=args.place_jitter_mm,
+        object_workspace_bounds_mm=tuple(float(value) for value in args.workspace_bounds_mm),
+        place_target_mm=None if args.place_target_mm is None else tuple(float(v) for v in args.place_target_mm),
     )
 
     entries = []

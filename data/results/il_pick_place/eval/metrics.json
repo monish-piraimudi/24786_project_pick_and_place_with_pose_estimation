@@ -1,11 +1,13 @@
 {
-  "num_episodes": 6,
-  "pick_success": 1.0,
-  "place_success": 1.0,
-  "total_success": 1.0,
-  "final_place_error_mm": 0.1230316162109375,
+  "num_episodes": 50,
+  "pick_success": 0.22,
+  "place_success": 0.36,
+  "total_success": 0.18,
+  "final_place_error_mm": 31.44296169281006,
   "dropped_object_rate": 0.0,
   "failure_phase_counts": {
-    "completed": 6
+    "completed": 9,
+    "approach_pick": 40,
+    "approach_place": 1
   }
 }

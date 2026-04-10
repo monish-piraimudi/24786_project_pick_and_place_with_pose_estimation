@@ -16,6 +16,8 @@ except ImportError:
 sys.path.append(os.path.dirname(os.path.realpath(__file__)) + "/../../")
 
 from modules.camera_observation import default_image_shape
+from modules.emio_camera_observation import EmioCameraConfig, EmioCameraObservationSource
+from modules.imitation_policy import ImplicitBCAgent
 from modules.pick_place_policy_shared import (
     MAX_EPISODE_STEPS,
     PHASE_NAMES,
@@ -62,10 +64,13 @@ def _parse_scene_args(argv=None):
     parser.add_argument("--cube-z-mm", dest="cube_z_mm", type=float, default=None)
     parser.add_argument("--connection", dest="connection", action="store_true")
     parser.add_argument("--no-connection", dest="connection", action="store_false")
+    parser.add_argument("--real-rgb-observation", dest="real_rgb_observation", action="store_true")
+    parser.add_argument("--no-real-rgb-observation", dest="real_rgb_observation", action="store_false")
     parser.add_argument("--camera-tracking", dest="camera_tracking", action="store_true")
     parser.add_argument("--no-camera-tracking", dest="camera_tracking", action="store_false")
     parser.add_argument("--camera-preview", dest="camera_preview", action="store_true")
     parser.add_argument("--no-camera-preview", dest="camera_preview", action="store_false")
+    parser.add_argument("--camera-serial", dest="camera_serial", type=str, default=None)
     parser.add_argument(
         "--cube-marker-offset-mm",
         dest="cube_marker_offset_mm",
@@ -76,6 +81,7 @@ def _parse_scene_args(argv=None):
     )
     parser.set_defaults(
         connection=True,
+        real_rgb_observation=False,
         camera_tracking=False,
         camera_preview=False,
     )
@@ -161,6 +167,17 @@ def _default_task_tuning():
     if success_params:
         return success_params
     return fail_params
+
+
+def _pick_position_for_object(object_position, reference_pick_position, reference_object_position):
+    object_position = np.asarray(object_position, dtype=float).copy()
+    reference_pick_position = np.asarray(reference_pick_position, dtype=float)
+    reference_object_position = np.asarray(reference_object_position, dtype=float)
+    pick_position = object_position.copy()
+    pick_position[1] = float(
+        object_position[1] + (reference_pick_position[1] - reference_object_position[1])
+    )
+    return pick_position
 
 
 class PickAndPlaceEvaluator(Sofa.Core.Controller):
@@ -560,6 +577,11 @@ class PolicyInspectController(Sofa.Core.Controller):
         tuning,
         policy_path,
         image_shape,
+        real_rgb_observation,
+        camera_tracking,
+        camera_preview,
+        camera_serial,
+        cube_marker_offset_mm,
     ):
         Sofa.Core.Controller.__init__(self)
         self.name = "PolicyInspectController"
@@ -573,14 +595,18 @@ class PolicyInspectController(Sofa.Core.Controller):
         self.pick_marker_mo = pick_marker_mo
         self.tuning = tuning
         self.image_shape = tuple(image_shape)
+        self.real_rgb_observation = bool(real_rgb_observation)
+        self.camera_tracking = bool(camera_tracking)
+        self.camera_preview = bool(camera_preview)
+        self.camera_serial = camera_serial
+        self.cube_marker_offset_mm = np.asarray(cube_marker_offset_mm, dtype=np.float32)
         self.max_steps = MAX_EPISODE_STEPS
-        self.pick_offset = (
-            np.asarray(tuning["pick_position"], dtype=float)
-            - np.asarray(tuning["object_position"], dtype=float)
-        )
+        self.reference_object_position = np.asarray(tuning["object_position"], dtype=float).copy()
+        self.reference_pick_position = np.asarray(tuning["pick_position"], dtype=float).copy()
         self.place_position = np.asarray(tuning["place_position"], dtype=float)
         self.policy_path = self._resolve_policy_path(policy_path)
         self.policy_agent = None
+        self.camera_source = None
         self.handles = {
             "root": root,
             "demo": demo,
@@ -589,6 +615,7 @@ class PolicyInspectController(Sofa.Core.Controller):
             "tcp_mo": tcp_mo,
             "block_mo": block_mo,
             "gripper_state": gripper_state,
+            "camera_source": None,
             "tuning": tuning,
         }
         self.is_running = False
@@ -602,6 +629,7 @@ class PolicyInspectController(Sofa.Core.Controller):
         self._last_cube_selector = None
         root.policyCheckpointPath.value = str(self.policy_path)
         self._load_policy()
+        self._open_camera_source()
         self._sync_scene_to_selector(update_block=True)
 
     def _resolve_policy_path(self, policy_path):
@@ -610,14 +638,12 @@ class PolicyInspectController(Sofa.Core.Controller):
 
     def _load_policy(self):
         try:
-            from modules.imitation_policy import BehaviorCloningAgent
-
             if not self.policy_path.is_file():
                 raise FileNotFoundError(
                     f"Policy checkpoint not found: {self.policy_path}. "
                     "Use --policy-path to point at a trained checkpoint."
                 )
-            self.policy_agent = BehaviorCloningAgent.from_checkpoint(self.policy_path)
+            self.policy_agent = ImplicitBCAgent.from_checkpoint(self.policy_path)
         except Exception as exc:
             self.policy_agent = None
             if not self._load_error_logged:
@@ -628,6 +654,40 @@ class PolicyInspectController(Sofa.Core.Controller):
                 print("[P3][PolicyInspect] EXCEPTION", repr(exc))
                 traceback.print_exc()
                 self._load_error_logged = True
+
+    def _open_camera_source(self):
+        if not self.real_rgb_observation and not self.camera_tracking:
+            return
+        try:
+            self.camera_source = EmioCameraObservationSource(
+                EmioCameraConfig(
+                    image_shape=self.image_shape,
+                    show=self.camera_preview,
+                    track_markers=self.camera_tracking,
+                    compute_point_cloud=False,
+                    configuration="extended",
+                    camera_serial=self.camera_serial,
+                )
+            )
+            if not self.camera_source.open():
+                raise RuntimeError("Failed to open EmioCamera for policy inspection.")
+            self.handles["camera_source"] = self.camera_source
+        except Exception as exc:
+            self.camera_source = None
+            if not self._load_error_logged:
+                Sofa.msg_error(
+                    "PolicyInspectController",
+                    "Failed to open EmioCamera: " + str(exc),
+                )
+                print("[P3][PolicyInspect] EXCEPTION", repr(exc))
+                traceback.print_exc()
+                self._load_error_logged = True
+
+    def cleanup(self):
+        if self.camera_source is not None:
+            self.camera_source.close()
+            self.camera_source = None
+            self.handles["camera_source"] = None
 
     def _selected_object_position(self):
         base = np.asarray(self.tuning["object_position"], dtype=float).copy()
@@ -659,9 +719,32 @@ class PolicyInspectController(Sofa.Core.Controller):
             ]
         ]
 
+    def _update_camera_cube(self, trackers):
+        trackers = np.asarray(trackers, dtype=np.float32).reshape(-1, 3)
+        if trackers.shape[0] < 1:
+            self.root.cameraTrackingAvailable.value = False
+            return None
+        marker_position = trackers[0]
+        if not np.all(np.isfinite(marker_position)) or float(np.linalg.norm(marker_position)) <= 1e-3:
+            self.root.cameraTrackingAvailable.value = False
+            return None
+        cube_position = marker_position + self.cube_marker_offset_mm
+        self.root.cubeStartX.value = float(cube_position[0])
+        self.root.cubeStartZ.value = float(cube_position[2])
+        self.root.cameraCubeX.value = float(cube_position[0])
+        self.root.cameraCubeY.value = float(cube_position[1])
+        self.root.cameraCubeZ.value = float(cube_position[2])
+        self.root.cameraTrackingAvailable.value = True
+        self._sync_task_to_camera_cube(cube_position)
+        return cube_position.astype(np.float32)
+
     def _sync_scene_to_selector(self, update_block):
         object_position = self._selected_object_position()
-        pick_position = object_position + self.pick_offset
+        pick_position = _pick_position_for_object(
+            object_position,
+            self.reference_pick_position,
+            self.reference_object_position,
+        )
         self.tuning["object_position"] = object_position.astype(np.float32)
         self.tuning["pick_position"] = pick_position.astype(np.float32)
         self.demo.configure_positions(pick_position, self.place_position)
@@ -671,6 +754,21 @@ class PolicyInspectController(Sofa.Core.Controller):
         if update_block:
             self._set_block_pose(object_position)
         return object_position, pick_position
+
+    def _sync_task_to_camera_cube(self, cube_position):
+        cube_position = np.asarray(cube_position, dtype=np.float32).copy()
+        pick_position = _pick_position_for_object(
+            cube_position,
+            self.reference_pick_position,
+            self.reference_object_position,
+        ).astype(np.float32)
+        self.tuning["object_position"] = cube_position
+        self.tuning["pick_position"] = pick_position
+        self.demo.configure_positions(pick_position, self.place_position)
+        self.evaluator.reset_task(cube_position, pick_position)
+        if self.pick_marker_mo is not None:
+            self.pick_marker_mo.position.value = [[float(pick_position[0]), float(pick_position[1]), float(pick_position[2])]]
+        self._set_block_pose(cube_position)
 
     def _reset_rollout(self):
         self._sync_scene_to_selector(update_block=True)
@@ -709,8 +807,22 @@ class PolicyInspectController(Sofa.Core.Controller):
             self.root.policyInspectActive.value = False
             return
 
+        observation = None
+        if self.camera_source is not None:
+            try:
+                observation, trackers = self.camera_source.update()
+                if self.camera_tracking:
+                    self._update_camera_cube(trackers)
+            except Exception:
+                observation = None
+
         selected_cube = self._selected_cube_key()
         slider_changed = self._last_cube_selector is not None and selected_cube != self._last_cube_selector
+        camera_pose_moved = (
+            self.camera_tracking
+            and self._last_cube_selector is not None
+            and np.linalg.norm(np.asarray(selected_cube, dtype=float) - np.asarray(self._last_cube_selector, dtype=float)) >= 8.0
+        )
 
         if self._auto_start_pending and not self.is_running:
             self._reset_rollout()
@@ -719,7 +831,7 @@ class PolicyInspectController(Sofa.Core.Controller):
         if not self.is_running:
             self._sync_scene_to_selector(update_block=True)
             self._last_cube_selector = selected_cube
-            if slider_changed:
+            if (slider_changed and not self.camera_tracking) or camera_pose_moved:
                 self._reset_rollout()
         else:
             if self.step_count > 0:
@@ -736,41 +848,86 @@ class PolicyInspectController(Sofa.Core.Controller):
                 self._stop_rollout("max_steps_reached")
                 return
 
-            observation = render_observation(
-                self.handles,
-                self.phase,
-                self.image_shape,
-            )
+            if observation is None:
+                observation = render_observation(
+                    self.handles,
+                    self.phase,
+                    self.image_shape,
+                )
             action = np.asarray(self.policy_agent.predict(observation), dtype=np.float32)
             apply_policy_action(self.handles, action)
             self.phase_step += 1
             self.step_count += 1
 
+    def __del__(self):  # pragma: no cover - best effort cleanup during SOFA shutdown
+        try:
+            self.cleanup()
+        except Exception:
+            pass
 
-class CameraCubeTrackerMonitor(Sofa.Core.Controller):
 
-    def __init__(self, root, tracker, cube_marker_offset_mm):
+class EmioCameraMonitor(Sofa.Core.Controller):
+
+    def __init__(self, root, image_shape, camera_preview, camera_serial, cube_marker_offset_mm):
         Sofa.Core.Controller.__init__(self)
-        self.name = "CameraCubeTrackerMonitor"
+        self.name = "EmioCameraMonitor"
         self.root = root
-        self.tracker = tracker
-        self.cube_marker_offset_mm = np.asarray(cube_marker_offset_mm, dtype=float)
+        self.cube_marker_offset_mm = np.asarray(cube_marker_offset_mm, dtype=np.float32)
+        self.camera_source = None
+        self._error_logged = False
+        try:
+            self.camera_source = EmioCameraObservationSource(
+                EmioCameraConfig(
+                    image_shape=image_shape,
+                    show=bool(camera_preview),
+                    track_markers=True,
+                    compute_point_cloud=False,
+                    configuration="extended",
+                    camera_serial=camera_serial,
+                )
+            )
+            if not self.camera_source.open():
+                raise RuntimeError("Failed to open EmioCamera monitor.")
+        except Exception as exc:
+            self.camera_source = None
+            self._log_error(exc)
+
+    def _log_error(self, exc):
+        if self._error_logged:
+            return
+        Sofa.msg_error("EmioCameraMonitor", "Failed to open/update EmioCamera: " + str(exc))
+        print("[P3][SceneCamera] EXCEPTION", repr(exc))
+        traceback.print_exc()
+        self._error_logged = True
 
     def onAnimateBeginEvent(self, _event):
-        if self.tracker is None or getattr(self.tracker, "mo", None) is None:
+        if self.camera_source is None:
+            self.root.cameraTrackingAvailable.value = False
+            return
+        try:
+            _frame, trackers = self.camera_source.update()
+        except Exception as exc:
+            self.root.cameraTrackingAvailable.value = False
+            self._log_error(exc)
+            return
+
+        trackers = np.asarray(trackers, dtype=np.float32).reshape(-1, 3)
+        if trackers.shape[0] < 1 or not _is_valid_tracker_xyz(trackers[0]):
             self.root.cameraTrackingAvailable.value = False
             return
 
-        points = np.asarray(self.tracker.mo.position.value, dtype=float).reshape(-1, 3)
-        if points.shape[0] < 1 or not _is_valid_tracker_xyz(points[0]):
-            self.root.cameraTrackingAvailable.value = False
-            return
-
-        cube_xyz = points[0] + self.cube_marker_offset_mm
+        cube_xyz = trackers[0] + self.cube_marker_offset_mm
         self.root.cameraCubeX.value = float(cube_xyz[0])
         self.root.cameraCubeY.value = float(cube_xyz[1])
         self.root.cameraCubeZ.value = float(cube_xyz[2])
         self.root.cameraTrackingAvailable.value = True
+
+    def __del__(self):  # pragma: no cover - best effort cleanup
+        try:
+            if self.camera_source is not None:
+                self.camera_source.close()
+        except Exception:
+            pass
 
 
 def createScene(rootnode):
@@ -861,30 +1018,18 @@ def createScene(rootnode):
     emio.addObject(AssemblyController(emio))
     print("[P3][Scene] emio inserted")
 
-    if args.connection and args.camera_tracking:
+    if (args.camera_tracking or args.real_rgb_observation) and args.mode != "policy_inspect":
         try:
-            from parts.controllers.trackercontroller import DotTracker
-
-            camera_tracker = rootnode.addObject(
-                DotTracker(
-                    name="DotTracker",
-                    root=rootnode,
-                    configuration="extended",
-                    nb_tracker=1,
-                    show_video_feed=args.camera_preview,
-                    track_colors=True,
-                    compute_point_cloud=False,
-                    scale=1,
-                )
-            )
             rootnode.addObject(
-                CameraCubeTrackerMonitor(
+                EmioCameraMonitor(
                     root=rootnode,
-                    tracker=camera_tracker,
+                    image_shape=default_image_shape(),
+                    camera_preview=args.camera_preview,
+                    camera_serial=args.camera_serial,
                     cube_marker_offset_mm=args.cube_marker_offset_mm,
                 )
             )
-            print("[P3][Scene] camera tracker added")
+            print("[P3][Scene] emio camera monitor added")
         except Exception as exc:
             Sofa.msg_error(__file__, "Camera not detected: " + str(exc))
 
@@ -975,15 +1120,19 @@ def createScene(rootnode):
     print("[P3][Scene] GUI controls added")
 
     # User-tuned waypoints and object spawn pose.
-    pick_position = np.asarray(tuning["pick_position"], dtype=float).copy()
+    reference_pick_position = np.asarray(tuning["pick_position"], dtype=float).copy()
     place_position = np.asarray(tuning["place_position"], dtype=float).copy()
-    object_position = np.asarray(tuning["object_position"], dtype=float).copy()
-    pick_offset = pick_position - object_position
+    reference_object_position = np.asarray(tuning["object_position"], dtype=float).copy()
+    object_position = reference_object_position.copy()
     if args.cube_x_mm is not None:
         object_position[0] = float(args.cube_x_mm)
     if args.cube_z_mm is not None:
         object_position[2] = float(args.cube_z_mm)
-    pick_position = object_position + pick_offset
+    pick_position = _pick_position_for_object(
+        object_position,
+        reference_pick_position,
+        reference_object_position,
+    )
     tuning["object_position"] = object_position.tolist()
     tuning["pick_position"] = pick_position.tolist()
     tuning["place_position"] = place_position.tolist()
@@ -1092,6 +1241,11 @@ def createScene(rootnode):
                 tuning=tuning,
                 policy_path=args.policy_path,
                 image_shape=default_image_shape(),
+                real_rgb_observation=args.real_rgb_observation,
+                camera_tracking=args.camera_tracking,
+                camera_preview=args.camera_preview,
+                camera_serial=args.camera_serial,
+                cube_marker_offset_mm=args.cube_marker_offset_mm,
             )
         )
         print("[P3][Scene] policy inspect controller added")

@@ -1,4 +1,4 @@
-"""Interactive SOFA scene entrypoint for visualizing the trained policy."""
+"""Interactive SOFA scene entrypoint for visualizing the trained policy without camera hardware."""
 
 from __future__ import annotations
 
@@ -22,8 +22,9 @@ def createScene(rootnode):
             "policy_inspect",
             "--policy-path",
             "data/results/il_pick_place/bc_policy.pth",
-            "--no-connection",
+            "--no-real-rgb-observation",
             "--no-camera-tracking",
+            "--no-connection",
         ],
     )
 
