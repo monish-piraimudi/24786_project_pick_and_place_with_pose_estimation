@@ -194,7 +194,7 @@ def main():
         default=PROJECT_DIR / "data/results/il_pick_place/bc_policy.pth",
         help="Path where the trained policy checkpoint will be saved. Relative paths are resolved from this lab folder.",
     )
-    parser.add_argument("--epochs", type=int, default=30, help="Training epochs")
+    parser.add_argument("--epochs", type=int, default=60, help="Training epochs")
     parser.add_argument("--batch-size", type=int, default=128, help="Batch size")
     parser.add_argument("--learning-rate", type=float, default=1e-3, help="Adam learning rate")
     parser.add_argument("--seed", type=int, default=0, help="Random seed")
