@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import numpy as np
 
-from modules.camera_observation import render_pick_place_image
-
 
 PHASE_NAMES = [
     "approach_pick",
@@ -18,6 +16,13 @@ PHASE_NAMES = [
     "retreat",
 ]
 PHASE_INDEX = {name: index for index, name in enumerate(PHASE_NAMES)}
+STATE_FEATURE_NAMES = (
+    "phase_index",
+    "gripper_opening",
+    "held_flag",
+    "tcp_y",
+    "cube_y",
+)
 
 ACTION_DIM = 4
 ACTION_LIMIT_MM = 5.0
@@ -112,6 +117,53 @@ def command_to_opening(demo, command: float) -> float:
     return float(demo.opening_open + command * (demo.opening_closed - demo.opening_open))
 
 
+def build_state_observation(
+    handles: dict,
+    phase: str,
+    *,
+    cube_position: np.ndarray | None = None,
+    gripper_opening: float | None = None,
+    held_flag: float | None = None,
+) -> np.ndarray:
+    tuning = handles["tuning"]
+    demo = handles["demo"]
+
+    if cube_position is None:
+        cube_position = rigid_xyz(handles["block_mo"])
+    cube_position = np.asarray(cube_position, dtype=np.float32).reshape(-1)
+
+    if gripper_opening is None:
+        gripper_opening = float(handles["root"].commandedOpening.value)
+    if held_flag is None:
+        evaluator = handles["evaluator"]
+        held_flag = float(bool(evaluator.is_attached or evaluator.lifted))
+
+    opening_min = float(tuning["gripper_opening_min"])
+    opening_max = float(tuning["gripper_opening_max"])
+    opening_span = max(1e-6, opening_max - opening_min)
+    phase_value = float(PHASE_INDEX[phase]) / max(1, len(PHASE_NAMES) - 1)
+    opening_value = float(np.clip((float(gripper_opening) - opening_min) / opening_span, 0.0, 1.0))
+
+    base_y = float(np.asarray(tuning["object_position"], dtype=np.float32)[1])
+    height_span = max(
+        1.0,
+        float(demo.hover_lift_height) + max(abs(float(demo.pick_height_offset)), abs(float(demo.place_height_offset))),
+    )
+    tcp_y = float((rigid_xyz(handles["tcp_mo"])[1] - base_y) / height_span)
+    cube_y = float((cube_position[1] - base_y) / height_span)
+
+    return np.asarray(
+        [
+            phase_value,
+            opening_value,
+            float(held_flag),
+            tcp_y,
+            cube_y,
+        ],
+        dtype=np.float32,
+    )
+
+
 def at_waypoint(handles: dict, phase: str) -> bool:
     tcp_position = rigid_xyz(handles["tcp_mo"])
     return float(np.linalg.norm(phase_target(handles["demo"], phase) - tcp_position)) <= POSE_TOLERANCE_MM
@@ -165,21 +217,13 @@ def render_observation(
     cube_position: np.ndarray | None = None,
     cube_yaw_deg: float | None = None,
 ) -> np.ndarray:
-    block_pose = rigid_pose(handles["block_mo"])
-    if cube_position is None:
-        cube_position = block_pose[:3]
-    if cube_yaw_deg is None:
-        cube_yaw_deg = quaternion_to_yaw_degrees(block_pose[3:7])
-    return render_pick_place_image(
-        tcp_position=rigid_xyz(handles["tcp_mo"]),
-        cube_position=np.asarray(cube_position, dtype=np.float32),
-        target_position=np.asarray(handles["tuning"]["place_position"], dtype=np.float32),
-        tip_positions=gripper_tips(handles["gripper_state"]),
-        cube_yaw_deg=float(cube_yaw_deg),
-        phase_index=PHASE_INDEX[phase],
-        num_phases=len(PHASE_NAMES),
-        image_shape=image_shape,
-    )
+    del phase, image_shape, cube_position, cube_yaw_deg
+    sim_camera_source = handles.get("sim_camera_source")
+    if sim_camera_source is None:
+        raise RuntimeError(
+            "Synthetic RGB observation requested without an initialized simulated Emio camera source."
+        )
+    return np.asarray(sim_camera_source.update(), dtype=np.uint8)
 
 
 def expert_action(handles: dict, phase: str) -> np.ndarray:
@@ -203,12 +247,12 @@ def apply_policy_action(handles: dict, action: np.ndarray) -> np.ndarray:
     if action.shape[0] != ACTION_DIM:
         raise ValueError(f"Expected action dim {ACTION_DIM}, got {action.shape[0]}")
 
-    target_mo = handles["target_mo"]
     demo = handles["demo"]
     clipped_delta = clip_delta(action[:3])
     gripper_command = float(np.clip(action[3], 0.0, 1.0))
-    current_target = as_array(target_mo.position).reshape(-1)[:3].astype(np.float32)
-    next_target = current_target + clipped_delta
+    # Policy deltas are defined in the current TCP frame to match expert labels.
+    current_tcp = rigid_xyz(handles["tcp_mo"])
+    next_target = current_tcp + clipped_delta
     demo._set_target_position(next_target)
     demo._set_gripper_opening(command_to_opening(demo, gripper_command))
     return np.concatenate([clipped_delta, np.array([gripper_command], dtype=np.float32)]).astype(np.float32)

@@ -6,8 +6,9 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 
-from modules.imitation_data import flatten_episode_dataset, load_episode_paths, split_episode_paths
-from modules.imitation_policy import DEFAULT_ACTION_BOUNDS, ImplicitBCPolicy, save_policy_checkpoint
+from modules.imitation_data import flatten_hybrid_episode_dataset, load_episode_paths, split_episode_paths
+from modules.imitation_policy import DEFAULT_ACTION_BOUNDS, HYBRID_MODEL_TYPE, ImplicitBCPolicy, save_policy_checkpoint
+from modules.pick_place_policy_shared import STATE_FEATURE_NAMES
 
 
 PROJECT_DIR = Path(__file__).resolve().parent
@@ -18,65 +19,72 @@ def _resolve_project_path(path: Path) -> Path:
     return path if path.is_absolute() else (PROJECT_DIR / path)
 
 
-def _describe_episode_signature(path: Path) -> tuple[tuple[int, ...], tuple[int, ...]]:
+def _describe_episode_signature(path: Path) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
     with np.load(path, allow_pickle=False) as episode:
         observation_shape = tuple(int(dim) for dim in episode["observation"].shape)
+        state_shape = tuple(int(dim) for dim in episode["state_observation"].shape)
         action_shape = tuple(int(dim) for dim in episode["action"].shape)
-    return observation_shape, action_shape
+    return observation_shape, state_shape, action_shape
 
 
-def _validate_image_episode_paths(episode_paths: list[Path]) -> tuple[tuple[int, int, int], tuple[int]]:
+def _validate_hybrid_episode_paths(episode_paths: list[Path]) -> tuple[tuple[int, int, int], tuple[int], tuple[int]]:
     if not episode_paths:
         raise SystemExit("Need at least 3 saved episodes to train/validate/test the policy")
 
     incompatible = []
     image_shapes = set()
+    state_shapes = set()
     action_shapes = set()
 
     for episode_path in episode_paths:
-        observation_shape, action_shape = _describe_episode_signature(episode_path)
+        observation_shape, state_shape, action_shape = _describe_episode_signature(episode_path)
         is_image_episode = (
             len(observation_shape) == 4
             and observation_shape[-1] == 3
+            and len(state_shape) == 2
+            and state_shape[-1] == len(STATE_FEATURE_NAMES)
             and len(action_shape) == 2
             and action_shape[-1] == 4
         )
         if not is_image_episode:
-            incompatible.append((episode_path.name, observation_shape, action_shape))
+            incompatible.append((episode_path.name, observation_shape, state_shape, action_shape))
             continue
         image_shapes.add(observation_shape[1:])
+        state_shapes.add(state_shape[1:])
         action_shapes.add(action_shape[1:])
 
     if incompatible:
         message_lines = [
-            "Dataset directory contains incompatible episodes. Implicit BC training requires an image-only dataset.",
+            "Dataset directory contains incompatible episodes. Hybrid implicit BC training requires image and state observations.",
             "Found the following incompatible episode shapes:",
         ]
-        for episode_name, observation_shape, action_shape in incompatible[:10]:
+        for episode_name, observation_shape, state_shape, action_shape in incompatible[:10]:
             message_lines.append(
-                f"  {episode_name}: observation_shape={observation_shape} action_shape={action_shape}"
+                f"  {episode_name}: observation_shape={observation_shape} state_shape={state_shape} action_shape={action_shape}"
             )
         if len(incompatible) > 10:
             message_lines.append(f"  ... and {len(incompatible) - 10} more")
         message_lines.append(
-            "Move legacy vector/synthetic episodes out of this folder or point --dataset-dir to a clean real-RGB episode directory."
+            "Recollect episodes with state_observation enabled or point --dataset-dir to a hybrid dataset directory."
         )
         raise SystemExit("\n".join(message_lines))
 
-    if len(image_shapes) != 1 or len(action_shapes) != 1:
+    if len(image_shapes) != 1 or len(state_shapes) != 1 or len(action_shapes) != 1:
         raise SystemExit(
-            "Dataset directory contains inconsistent image or action shapes across episodes. "
-            f"image_shapes={sorted(image_shapes)} action_shapes={sorted(action_shapes)}"
+            "Dataset directory contains inconsistent image, state, or action shapes across episodes. "
+            f"image_shapes={sorted(image_shapes)} state_shapes={sorted(state_shapes)} action_shapes={sorted(action_shapes)}"
         )
 
     image_shape = next(iter(image_shapes))
+    state_shape = next(iter(state_shapes))
     action_shape = next(iter(action_shapes))
-    return image_shape, action_shape
+    return image_shape, state_shape, action_shape
 
 
-def _make_loader(observations, actions, batch_size, shuffle):
+def _make_loader(observations, state_observations, actions, batch_size, shuffle):
     dataset = TensorDataset(
         torch.from_numpy(observations).float(),
+        torch.from_numpy(state_observations).float(),
         torch.from_numpy(actions).float(),
     )
     return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
@@ -106,6 +114,24 @@ def _prepare_images(train_obs, val_obs, test_obs):
     return _norm(train_obs), _norm(val_obs), _norm(test_obs), image_mean, image_std, image_shape
 
 
+def _prepare_states(train_state, val_state, test_state):
+    state_dim = int(train_state.shape[1])
+    train_state = train_state.astype(np.float32)
+    val_state = val_state.astype(np.float32)
+    test_state = test_state.astype(np.float32)
+
+    state_mean = train_state.mean(axis=0).astype(np.float32)
+    state_std = train_state.std(axis=0).astype(np.float32)
+    state_std = np.where(state_std < 1e-6, 1.0, state_std).astype(np.float32)
+
+    def _norm(state):
+        if state.size == 0:
+            return np.zeros((0, state_dim), dtype=np.float32)
+        return ((state - state_mean.reshape(1, -1)) / state_std.reshape(1, -1)).astype(np.float32)
+
+    return _norm(train_state), _norm(val_state), _norm(test_state), state_mean, state_std
+
+
 def _sample_negative_actions(actions: torch.Tensor, action_bounds: np.ndarray, num_negatives: int) -> torch.Tensor:
     batch_size, action_dim = actions.shape
     lower = torch.as_tensor(action_bounds[:, 0], dtype=actions.dtype, device=actions.device)
@@ -125,8 +151,8 @@ def _sample_negative_actions(actions: torch.Tensor, action_bounds: np.ndarray, n
     return mixed
 
 
-def _implicit_bc_loss(model, batch_x, batch_y, action_bounds: np.ndarray, num_negatives: int) -> torch.Tensor:
-    obs_embed = model.encode_observation(batch_x)
+def _implicit_bc_loss(model, batch_x, batch_state, batch_y, action_bounds: np.ndarray, num_negatives: int) -> torch.Tensor:
+    obs_embed = model.encode_observation(batch_x, batch_state)
     pos_energy = model.forward_with_embedding(obs_embed, batch_y).unsqueeze(1)
     neg_actions = _sample_negative_actions(batch_y, action_bounds, num_negatives)
     obs_embed_neg = obs_embed.unsqueeze(1).repeat(1, num_negatives, 1).reshape(-1, obs_embed.shape[-1])
@@ -144,10 +170,11 @@ def _evaluate(model, loader, device, action_bounds: np.ndarray):
     total_loss = 0.0
     num_batches = 0
     with torch.inference_mode():
-        for batch_x, batch_y in loader:
+        for batch_x, batch_state, batch_y in loader:
             batch_x = batch_x.to(device)
+            batch_state = batch_state.to(device)
             batch_y = batch_y.to(device)
-            loss = _implicit_bc_loss(model, batch_x, batch_y, action_bounds, NEGATIVE_SAMPLES)
+            loss = _implicit_bc_loss(model, batch_x, batch_state, batch_y, action_bounds, NEGATIVE_SAMPLES)
             total_loss += float(loss.item())
             num_batches += 1
     return total_loss / max(1, num_batches)
@@ -190,22 +217,31 @@ def main():
     episode_paths = load_episode_paths(dataset_dir)
     if len(episode_paths) < 3:
         raise SystemExit("Need at least 3 saved episodes to train/validate/test the policy")
-    image_shape_signature, action_shape_signature = _validate_image_episode_paths(episode_paths)
+    image_shape_signature, state_shape_signature, action_shape_signature = _validate_hybrid_episode_paths(episode_paths)
 
     train_paths, val_paths, test_paths = split_episode_paths(episode_paths, seed=args.seed)
-    train_obs, train_actions = flatten_episode_dataset(train_paths, observation_key="observation")
-    val_obs, val_actions = flatten_episode_dataset(val_paths, observation_key="observation")
-    test_obs, test_actions = flatten_episode_dataset(test_paths, observation_key="observation")
+    train_obs, train_state, train_actions = flatten_hybrid_episode_dataset(train_paths)
+    val_obs, val_state, val_actions = flatten_hybrid_episode_dataset(val_paths)
+    test_obs, test_state, test_actions = flatten_hybrid_episode_dataset(test_paths)
 
     if train_obs.ndim != 4 or train_obs.shape[-1] != 3:
         raise SystemExit(
             f"Expected RGB image observations with shape [N, H, W, 3], got {train_obs.shape}"
+        )
+    if train_state.ndim != 2 or train_state.shape[-1] != len(STATE_FEATURE_NAMES):
+        raise SystemExit(
+            f"Expected state observations with shape [N, {len(STATE_FEATURE_NAMES)}], got {train_state.shape}"
         )
 
     train_obs, val_obs, test_obs, image_mean, image_std, image_shape = _prepare_images(
         train_obs,
         val_obs,
         test_obs,
+    )
+    train_state, val_state, test_state, state_mean, state_std = _prepare_states(
+        train_state,
+        val_state,
+        test_state,
     )
 
     print("Dataset summary:")
@@ -214,16 +250,17 @@ def main():
     print(
         f"  observation_signature=[N, {image_shape_signature[0]}, {image_shape_signature[1]}, {image_shape_signature[2]}]"
     )
+    print(f"  state_signature=[N, {state_shape_signature[0]}]")
     print(f"  action_signature=[N, {action_shape_signature[0]}]")
     print(f"  split_episodes train={len(train_paths)} val={len(val_paths)} test={len(test_paths)}")
     print(f"  split_steps train={int(train_obs.shape[0])} val={int(val_obs.shape[0])} test={int(test_obs.shape[0])}")
 
-    train_loader = _make_loader(train_obs, train_actions, args.batch_size, shuffle=True)
-    val_loader = _make_loader(val_obs, val_actions, args.batch_size, shuffle=False)
-    test_loader = _make_loader(test_obs, test_actions, args.batch_size, shuffle=False)
+    train_loader = _make_loader(train_obs, train_state, train_actions, args.batch_size, shuffle=True)
+    val_loader = _make_loader(val_obs, val_state, val_actions, args.batch_size, shuffle=False)
+    test_loader = _make_loader(test_obs, test_state, test_actions, args.batch_size, shuffle=False)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = ImplicitBCPolicy(input_channels=int(image_shape[2])).to(device)
+    model = ImplicitBCPolicy(input_channels=int(image_shape[2]), state_dim=int(train_state.shape[1])).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
 
     action_bounds = DEFAULT_ACTION_BOUNDS.copy()
@@ -233,11 +270,12 @@ def main():
         model.train()
         train_loss = 0.0
         num_batches = 0
-        for batch_x, batch_y in train_loader:
+        for batch_x, batch_state, batch_y in train_loader:
             batch_x = batch_x.to(device)
+            batch_state = batch_state.to(device)
             batch_y = batch_y.to(device)
             optimizer.zero_grad()
-            loss = _implicit_bc_loss(model, batch_x, batch_y, action_bounds, NEGATIVE_SAMPLES)
+            loss = _implicit_bc_loss(model, batch_x, batch_state, batch_y, action_bounds, NEGATIVE_SAMPLES)
             loss.backward()
             optimizer.step()
             train_loss += float(loss.item())
@@ -266,8 +304,12 @@ def main():
         "test_steps": int(test_obs.shape[0]),
         "best_val_loss": float(best_val_loss),
         "test_loss": float(test_loss),
-        "model_type": "implicit_bc",
+        "model_type": HYBRID_MODEL_TYPE,
         "action_bounds": action_bounds.tolist(),
+        "state_dim": int(train_state.shape[1]),
+        "state_feature_names": list(STATE_FEATURE_NAMES),
+        "state_mean": state_mean.astype(np.float32).tolist(),
+        "state_std": state_std.astype(np.float32).tolist(),
         "search_config": {
             "num_samples": 192,
             "num_elites": 24,

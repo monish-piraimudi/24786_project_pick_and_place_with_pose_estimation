@@ -15,13 +15,15 @@ from modules.pick_place_policy_shared import (
     PHASE_INDEX,
     PHASE_NAMES,
     advance_phase,
+    apply_expert_target,
     apply_policy_action,
+    build_state_observation,
     expert_action,
-    phase_from_elapsed,
     render_observation,
     rigid_pose,
     rigid_xyz,
 )
+from modules.sim_emio_camera_observation import SimEmioCameraConfig, SimEmioCameraObservationSource
 from modules.sofa_bootstrap import bootstrap_and_validate_sofa
 
 
@@ -63,6 +65,11 @@ class PickPlaceTaskConfig:
     real_rgb_observation: bool = False
     camera_serial: str | None = None
     image_shape: tuple[int, int, int] = field(default_factory=default_image_shape)
+    sim_camera_render_shape: tuple[int, int, int] = (256, 256, 3)
+    sim_camera_fov_deg: float = 45.0
+    sim_camera_translation_offset_mm: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    sim_camera_rotation_offset_deg: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    sim_camera_crop_norm_xywh: tuple[float, float, float, float] = (0.0, 0.0, 1.0, 1.0)
     task_tuning: dict | None = None
     object_workspace_bounds_mm: tuple[float, float, float, float] = DEFAULT_WORKSPACE_BOUNDS_MM
     place_target_mm: tuple[float, float, float] | None = None
@@ -147,6 +154,7 @@ def _resolve_handles(root, tuning: dict[str, float | np.ndarray]) -> dict:
         "gripper_state": root.Simulation.Emio.centerpart.Effector.getMechanicalState(),
         "gripper_opening": root.Simulation.Emio.centerpart.Effector.Distance.DistanceMapping.restLengths,
         "camera_source": None,
+        "sim_camera_source": None,
         "tuning": tuning,
         "pick_base_y_offset": float(
             np.asarray(tuning["pick_position"], dtype=np.float32)[1]
@@ -206,12 +214,8 @@ def _build_scene(config: PickPlaceTaskConfig) -> tuple[object, dict]:
 
     Sofa.Simulation.init(root)
     handles = _resolve_handles(root, tuning)
-    if config.mode == "policy":
-        handles["demo"].is_active = False
-        root.autoDemoActive.value = False
-    else:
-        handles["demo"].is_active = True
-        root.autoDemoActive.value = True
+    handles["demo"].is_active = False
+    root.autoDemoActive.value = False
     return root, handles
 
 
@@ -236,6 +240,29 @@ def _open_camera_source(config: PickPlaceTaskConfig) -> EmioCameraObservationSou
             "--no-real-rgb-observation --no-camera-tracking."
         )
     return camera_source
+
+
+def _open_sim_camera_source(config: PickPlaceTaskConfig, handles: dict) -> SimEmioCameraObservationSource:
+    sim_camera_source = SimEmioCameraObservationSource(
+        handles,
+        SimEmioCameraConfig(
+            image_shape=config.image_shape,
+            render_shape=config.sim_camera_render_shape,
+            extended=True,
+            fov_deg=config.sim_camera_fov_deg,
+            translation_offset_mm=config.sim_camera_translation_offset_mm,
+            rotation_offset_deg=config.sim_camera_rotation_offset_deg,
+            crop_norm_xywh=config.sim_camera_crop_norm_xywh,
+        ),
+    )
+    try:
+        if not sim_camera_source.open():
+            raise RuntimeError("Simulated camera source returned False from open().")
+    except Exception as exc:
+        raise RuntimeError(
+            "Synthetic Emio-camera observations require GL-capable offscreen rendering support."
+        ) from exc
+    return sim_camera_source
 
 
 def run_single_episode(config: PickPlaceTaskConfig) -> dict:
@@ -268,27 +295,25 @@ def run_single_episode(config: PickPlaceTaskConfig) -> dict:
         recorder = EpisodeRecorder(config.output_dir, config.episode_id)
 
     camera_source = None
+    sim_camera_source = None
     done = False
     task_step = 0
     dropped_object = False
     saved_path = None
     failure_phase = "not_started"
+    phase = PHASE_NAMES[0]
+    phase_step = 0
+    close_counter = 0
 
     try:
         camera_source = _open_camera_source(config)
         handles["camera_source"] = camera_source
+        if not config.real_rgb_observation:
+            sim_camera_source = _open_sim_camera_source(config, handles)
+            handles["sim_camera_source"] = sim_camera_source
 
         while task_step < config.max_steps and not done:
-            if config.mode in {"expert", "collect"}:
-                elapsed = float(root.time.value)
-                phase = phase_from_elapsed(demo, elapsed)
-                if phase is None:
-                    break
-            else:
-                if task_step == 0:
-                    phase = PHASE_NAMES[0]
-                    phase_step = 0
-                    close_counter = 0
+            if task_step > 0:
                 phase, phase_step, close_counter, done = advance_phase(
                     handles, phase, phase_step, close_counter
                 )
@@ -299,7 +324,9 @@ def run_single_episode(config: PickPlaceTaskConfig) -> dict:
             camera_cube_position = None
             trackers = np.zeros((0, 3), dtype=np.float32)
             if camera_source is not None:
-                observation, trackers = camera_source.update()
+                camera_frame, trackers = camera_source.update()
+                if config.real_rgb_observation:
+                    observation = camera_frame
 
             if camera_tracking_requested:
                 camera_cube_position, camera_step_available, camera_step_status = _tracker_cube_state(
@@ -340,11 +367,20 @@ def run_single_episode(config: PickPlaceTaskConfig) -> dict:
                     cube_yaw_deg=0.0 if camera_cube_position is not None else None,
                 )
 
+            current_gripper_opening = float(root.commandedOpening.value)
+            current_held_flag = float(bool(evaluator.is_attached or evaluator.lifted))
+            state_observation = build_state_observation(
+                handles,
+                phase,
+                gripper_opening=current_gripper_opening,
+                held_flag=current_held_flag,
+            )
+
             if config.mode in {"expert", "collect"}:
-                action = expert_action(handles, phase)
+                action = apply_expert_target(handles, phase)
                 executed_action = action
             else:
-                action = np.asarray(policy_agent.predict(observation), dtype=np.float32)
+                action = np.asarray(policy_agent.predict(observation, state_observation), dtype=np.float32)
                 executed_action = apply_policy_action(handles, action)
 
             failure_phase = phase
@@ -352,6 +388,7 @@ def run_single_episode(config: PickPlaceTaskConfig) -> dict:
             if recorder is not None:
                 recorder.append(
                     observation=observation.astype(np.uint8),
+                    state_observation=state_observation.astype(np.float32),
                     action=action.astype(np.float32),
                     executed_action=executed_action.astype(np.float32),
                     phase_index=np.int32(PHASE_INDEX[phase]),
@@ -366,8 +403,8 @@ def run_single_episode(config: PickPlaceTaskConfig) -> dict:
                     pick_position=np.asarray(handles["tuning"]["pick_position"], dtype=np.float32),
                     target_position=np.asarray(handles["tuning"]["place_position"], dtype=np.float32),
                     effector_pose=rigid_pose(handles["tcp_mo"]).astype(np.float32),
-                    gripper_opening=np.float32(root.commandedOpening.value),
-                    held_flag=np.int32(int(evaluator.is_attached or evaluator.lifted)),
+                    gripper_opening=np.float32(current_gripper_opening),
+                    held_flag=np.int32(int(current_held_flag)),
                     task_score=np.float32(root.taskScore.value),
                     task_lifted=np.int32(int(root.taskLifted.value)),
                     task_placed=np.int32(int(root.taskPlaced.value)),
@@ -378,10 +415,7 @@ def run_single_episode(config: PickPlaceTaskConfig) -> dict:
 
             Sofa.Simulation.animate(root, config.control_dt)
             task_step += 1
-            if config.mode == "policy":
-                phase_step += 1
-            elif not demo.is_active:
-                done = True
+            phase_step += 1
 
             block_position = rigid_xyz(handles["block_mo"])
             if root.taskLifted.value and not root.taskPlaced.value:
@@ -394,6 +428,8 @@ def run_single_episode(config: PickPlaceTaskConfig) -> dict:
                     }:
                         dropped_object = True
     finally:
+        if sim_camera_source is not None:
+            sim_camera_source.close()
         if camera_source is not None:
             camera_source.close()
 

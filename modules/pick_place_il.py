@@ -23,10 +23,12 @@ from modules.pick_place_policy_shared import (
     PHASE_NAMES,
     advance_phase,
     apply_policy_action,
+    build_state_observation,
     phase_opening,
     phase_target,
     render_observation,
 )
+from modules.sim_emio_camera_observation import SimEmioCameraConfig, SimEmioCameraObservationSource
 
 
 _RUNTIME_TASK_TUNING = None
@@ -607,6 +609,7 @@ class PolicyInspectController(Sofa.Core.Controller):
         self.policy_path = self._resolve_policy_path(policy_path)
         self.policy_agent = None
         self.camera_source = None
+        self.sim_camera_source = None
         self.handles = {
             "root": root,
             "demo": demo,
@@ -616,6 +619,7 @@ class PolicyInspectController(Sofa.Core.Controller):
             "block_mo": block_mo,
             "gripper_state": gripper_state,
             "camera_source": None,
+            "sim_camera_source": None,
             "tuning": tuning,
         }
         self.is_running = False
@@ -627,9 +631,10 @@ class PolicyInspectController(Sofa.Core.Controller):
         self._load_error_logged = False
         self._auto_start_pending = True
         self._last_cube_selector = None
+        self._camera_init_attempted = False
+        self._camera_ready = False
         root.policyCheckpointPath.value = str(self.policy_path)
         self._load_policy()
-        self._open_camera_source()
         self._sync_scene_to_selector(update_block=True)
 
     def _resolve_policy_path(self, policy_path):
@@ -656,38 +661,75 @@ class PolicyInspectController(Sofa.Core.Controller):
                 self._load_error_logged = True
 
     def _open_camera_source(self):
-        if not self.real_rgb_observation and not self.camera_tracking:
-            return
         try:
-            self.camera_source = EmioCameraObservationSource(
-                EmioCameraConfig(
-                    image_shape=self.image_shape,
-                    show=self.camera_preview,
-                    track_markers=self.camera_tracking,
-                    compute_point_cloud=False,
-                    configuration="extended",
-                    camera_serial=self.camera_serial,
+            if self.real_rgb_observation or self.camera_tracking:
+                self.camera_source = EmioCameraObservationSource(
+                    EmioCameraConfig(
+                        image_shape=self.image_shape,
+                        show=self.camera_preview,
+                        track_markers=self.camera_tracking,
+                        compute_point_cloud=False,
+                        configuration="extended",
+                        camera_serial=self.camera_serial,
+                    )
                 )
-            )
-            if not self.camera_source.open():
-                raise RuntimeError("Failed to open EmioCamera for policy inspection.")
-            self.handles["camera_source"] = self.camera_source
+                if not self.camera_source.open():
+                    raise RuntimeError("Failed to open EmioCamera for policy inspection.")
+                self.handles["camera_source"] = self.camera_source
+
+            if not self.real_rgb_observation:
+                self.sim_camera_source = SimEmioCameraObservationSource(
+                    self.handles,
+                    SimEmioCameraConfig(image_shape=self.image_shape),
+                )
+                if not self.sim_camera_source.open():
+                    raise RuntimeError("Failed to initialize simulated Emio camera for policy inspection.")
+                self.handles["sim_camera_source"] = self.sim_camera_source
         except Exception as exc:
+            if self.camera_source is not None:
+                try:
+                    self.camera_source.close()
+                except Exception:
+                    pass
             self.camera_source = None
+            self.handles["camera_source"] = None
+            if self.sim_camera_source is not None:
+                try:
+                    self.sim_camera_source.close()
+                except Exception:
+                    pass
+            self.sim_camera_source = None
+            self.handles["sim_camera_source"] = None
             if not self._load_error_logged:
                 Sofa.msg_error(
                     "PolicyInspectController",
-                    "Failed to open EmioCamera: " + str(exc),
+                    "Failed to open policy-inspection camera source: " + str(exc),
                 )
                 print("[P3][PolicyInspect] EXCEPTION", repr(exc))
                 traceback.print_exc()
                 self._load_error_logged = True
+            return False
+        return True
 
     def cleanup(self):
+        if self.sim_camera_source is not None:
+            self.sim_camera_source.close()
+            self.sim_camera_source = None
+            self.handles["sim_camera_source"] = None
         if self.camera_source is not None:
             self.camera_source.close()
             self.camera_source = None
             self.handles["camera_source"] = None
+        self._camera_ready = False
+
+    def _ensure_camera_source(self) -> bool:
+        if self._camera_ready:
+            return True
+        if self._camera_init_attempted:
+            return False
+        self._camera_init_attempted = True
+        self._camera_ready = bool(self._open_camera_source())
+        return self._camera_ready
 
     def _selected_object_position(self):
         base = np.asarray(self.tuning["object_position"], dtype=float).copy()
@@ -807,10 +849,16 @@ class PolicyInspectController(Sofa.Core.Controller):
             self.root.policyInspectActive.value = False
             return
 
+        if not self._ensure_camera_source():
+            self._stop_rollout("camera_init_failed")
+            return
+
         observation = None
         if self.camera_source is not None:
             try:
-                observation, trackers = self.camera_source.update()
+                camera_frame, trackers = self.camera_source.update()
+                if self.real_rgb_observation:
+                    observation = camera_frame
                 if self.camera_tracking:
                     self._update_camera_cube(trackers)
             except Exception:
@@ -854,7 +902,8 @@ class PolicyInspectController(Sofa.Core.Controller):
                     self.phase,
                     self.image_shape,
                 )
-            action = np.asarray(self.policy_agent.predict(observation), dtype=np.float32)
+            state_observation = build_state_observation(self.handles, self.phase)
+            action = np.asarray(self.policy_agent.predict(observation, state_observation), dtype=np.float32)
             apply_policy_action(self.handles, action)
             self.phase_step += 1
             self.step_count += 1

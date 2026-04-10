@@ -7,10 +7,21 @@ This lab uses the Emio pick-and-place scene as the source of truth for the full 
 The workflow is:
 - watch the scripted expert in SOFA
 - collect successful expert episodes from that same scene
-- train an implicit behavior-cloning policy on saved RGB observations
+- train an implicit behavior-cloning policy on saved RGB observations plus a small low-dimensional state vector
 - evaluate the learned policy in closed loop
 
-The deployed policy is image-based. It consumes real RGB observations from the Emio camera and predicts a 4D action by minimizing an energy model over observation-action pairs:
+The deployed policy is hybrid. It consumes:
+- an RGB observation
+- a 5D `state_observation`
+
+The state vector is:
+- normalized phase index
+- normalized gripper opening
+- held flag
+- normalized TCP height
+- normalized cube height
+
+The policy predicts a 4D action by minimizing an energy model over observation-action pairs:
 - `dx`
 - `dy`
 - `dz`
@@ -19,7 +30,7 @@ The deployed policy is image-based. It consumes real RGB observations from the E
 The scene uses a compact scripted pick-and-place structure:
 - kinematic block
 - scripted attach/release grasp logic
-- timed pick, lift, place, and retreat demo
+- state-machine pick, lift, place, and retreat progression
 
 :::
 
@@ -73,12 +84,12 @@ The current pipeline is split across a few small modules:
   Builds that exact scene headlessly, samples tray-wide object poses, records episodes, and runs learned-policy rollouts.
 - `modules/emio_camera_observation.py`
   Opens `EmioCamera`, updates frames and trackers, and provides real RGB observations plus tracker positions.
-- `modules/camera_observation.py`
-  Provides a synthetic fallback observation path for debugging when real RGB is disabled.
+- `modules/sim_emio_camera_observation.py`
+  Provides the default simulation-only RGB observation path by rendering an Emio-like perspective camera view when real RGB is disabled.
 - `modules/imitation_data.py`
-  Saves episodes, loads datasets, splits by episode, and computes rollout metrics.
+  Saves episodes, loads hybrid image/state datasets, splits by episode, and computes rollout metrics.
 - `modules/imitation_policy.py`
-  Defines the implicit BC energy model, action search, and checkpoint save/load helpers.
+  Defines the hybrid implicit BC energy model, action search, and checkpoint save/load helpers.
 
 The scene is the source of truth. The runtime scripts do not define a separate task; they only drive the scene for:
 - collection
@@ -140,11 +151,11 @@ Watch one full expert rollout in SOFA and describe what happens in each of the e
 
 `collect_il_dataset.py` runs the pick-and-place scene headlessly and records successful expert episodes.
 
-The saved episodes come from the scene's own timed demo. For each seed:
+The saved episodes now come from the same state-machine phase progression used at learned-policy inference time. For each seed:
 - the block spawn is sampled from a continuous tray workspace in X/Z
 - the pick location uses the same X/Z as the block
 - the place target stays fixed by default
-- the script records real RGB camera observations, expert 4D actions, executed actions, and tracker-assisted cube metadata at each step
+- the script records RGB observations, a 5D `state_observation`, expert 4D actions, executed actions, and tracker-assisted cube metadata at each step
 
 By default the workspace bounds are:
 - `x in [-35, 10]`
@@ -196,6 +207,7 @@ Each rollout is saved as one `.npz` trajectory file. This preserves temporal ord
 
 Important saved keys include:
 - `observation`
+- `state_observation`
 - `action`
 - `executed_action`
 - `tracked_cube_position`
@@ -216,15 +228,19 @@ Important saved keys include:
 
 For learning:
 - policy input is `observation`
+- policy input also includes `state_observation`
 - training target is `action`
 
-In this version of the lab, `observation` is expected to be an RGB image with shape `[N, H, W, 3]`, typically coming from the Emio camera.
+In this version of the lab:
+- `observation` is an RGB image with shape `[N, H, W, 3]`
+- `state_observation` has shape `[N, 5]`
 
 In `modules/imitation_data.py`:
 - `EpisodeRecorder` stores one rollout
 - `load_episode_paths(...)` finds saved episodes
 - `split_episode_paths(...)` splits by episode
 - `flatten_episode_dataset(...)` concatenates step data after splitting
+- `flatten_hybrid_episode_dataset(...)` concatenates image/state/action step data after splitting
 - `aggregate_rollout_metrics(...)` summarizes closed-loop performance
 
 Why split by episode instead of by timestep?
@@ -236,35 +252,39 @@ Why split by episode instead of by timestep?
 
 Inspect one saved `.npz` file and answer:
 1. what is the shape of `observation`?
-2. what is the shape of `action`?
-3. why is splitting by episode better than splitting by row?
+2. what is the shape of `state_observation`?
+3. what is the shape of `action`?
+4. why is splitting by episode better than splitting by row?
 
 :::
 
 ::::
 
-:::: collapse Step 4: Train The Image Policy
-## Step 4: Train The Image Policy
+:::: collapse Step 4: Train The Hybrid Policy
+## Step 4: Train The Hybrid Policy
 
 `train_il_policy.py` trains an implicit behavior-cloning policy from the saved episodes.
 
-With the default collection settings, the learned policy sees image observations from:
+With the default collection settings, the learned policy sees:
 - varying pickup locations
 - one fixed placement target
-- the same real RGB camera observation format at every timestep
+- the same RGB observation format at every timestep
+- a fixed-order 5D low-dimensional state vector at every timestep
 
-Training expects the newly saved image episodes from this lab folder. If the dataset directory contains old legacy vector episodes mixed with image episodes, training now stops with a clear error instead of silently skipping them.
+Training expects newly saved hybrid episodes from this lab folder. If the dataset directory contains old legacy image-only episodes mixed with hybrid episodes, training stops with a clear error instead of silently skipping them.
 
 The training script:
 - loads episode files
 - splits them into train, validation, and test episodes
 - flattens each split into stepwise arrays
 - normalizes RGB observations channel-wise
+- normalizes the 5D state vector feature-wise
 - trains an energy model on positive expert actions plus sampled negative actions
-- saves the checkpoint with image normalization statistics
+- saves the checkpoint with image normalization and state normalization statistics
 
-The current policy in `modules/imitation_policy.py` is image-only and implicit:
+The current policy in `modules/imitation_policy.py` is hybrid and implicit:
 - input shape `[H, W, 3]`
+- state shape `[5]`
 - action dimension `4`
 - inference selects the action with minimum predicted energy over a bounded search distribution
 
@@ -286,7 +306,7 @@ Output:
 ::: exercise
 **Exercise:**
 
-Run training and inspect the printed losses. Why must the exact same image normalization and action bounds be reused at inference time?
+Run training and inspect the printed losses. Why must the exact same image normalization, state normalization, and action bounds be reused at inference time?
 
 :::
 
@@ -328,7 +348,8 @@ Saved outputs:
 - `data/results/il_pick_place/eval/metrics.json`
 
 By default evaluation uses:
-- synthetic observations and no tracker, so it can run without attached hardware
+- simulated Emio-view RGB observations and no tracker, so it can run without attached hardware
+- the same 5D state vector used during hybrid training
 - the same fixed place target used during collection
 
 To evaluate with the camera attached, add:
@@ -370,7 +391,8 @@ Use the default `runSofa` button below to open the camera-free learned-policy sc
 
 This default scene:
 - does not require an attached Emio camera
-- uses the synthetic fallback observation path
+- uses the simulated Emio-view observation path
+- computes the same 5D `state_observation` used during training
 - keeps the place target fixed
 - starts the learned-policy rollout automatically when the scene opens
 - lets you move the cube in the scene and rerun after each rollout
@@ -388,6 +410,7 @@ Inside the live-camera GUI:
 - keep the place target fixed
 - the learned-policy rollout starts automatically when the scene opens
 - the policy consumes live RGB frames from the Emio camera
+- the policy also consumes the same 5D state vector built from the live scene state
 - tracker updates are used to align the cube pose and diagnostics with the observed object
 - after the rollout finishes, move the cube to a new tray position to trigger another trial automatically
 
@@ -427,7 +450,7 @@ Open the default GUI policy-inspection scene and test at least three different c
 In this lab you:
 - inspected the pick-and-place scene in SOFA
 - used that exact scene to generate imitation-learning episodes
-- trained an image-based implicit behavior-cloning policy
+- trained a hybrid image-plus-state implicit behavior-cloning policy
 - evaluated the learned controller in closed loop
 - compared expert and learned rollout performance
 
@@ -440,6 +463,7 @@ The key idea is that one scene drives the whole pipeline:
 From here, you can experiment with:
 - more demonstrations
 - wider workspace bounds
+- richer low-dimensional state features
 - different implicit-policy search hyperparameters
 - stronger image encoders
 
