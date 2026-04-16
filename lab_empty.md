@@ -4,40 +4,13 @@
 
 This lab uses the Emio pick-and-place scene as the source of truth for the full imitation-learning pipeline.
 
-The workflow is:
+In this lab, you will:
 - watch the scripted expert in SOFA
 - collect successful expert episodes from that same scene
 - train an implicit behavior-cloning policy on saved compact state observations
 - evaluate the learned policy in closed loop
 
-The deployed policy is state-only. It consumes:
-- a 17D `state_observation`
-
-The state vector is:
-- normalized TCP `x/y/z`
-- normalized cube `x/y/z`
-- normalized goal `x/y/z`
-- normalized TCP-to-cube delta in `x/y/z`
-- normalized cube-to-goal delta in `x/y/z`
-- normalized gripper opening
-- held flag
-
-Saved rollout files may still include RGB `observation` frames for debugging and inspection, but the learned policy ignores them.
-
-The policy predicts a 4D action by minimizing an energy model over state-action pairs:
-- `motor0_angle`
-- `motor1_angle`
-- `motor2_angle`
-- `motor3_angle`
-
-At runtime the controller logs:
-- `action` as the raw energy-minimizing proposal
-- `executed_action` as the smoothed and clipped command that is actually applied
-
-The scene uses a compact scripted pick-and-place structure:
-- kinematic block
-- scripted attach/release grasp logic
-- state-machine pick, lift, place, and retreat progression
+By the end of the lab, you should understand how one scene supports the full workflow from expert demonstration to imitation-learning evaluation, and why this lab uses an implicit behavior-cloning policy instead of direct action regression.
 
 :::
 
@@ -71,11 +44,11 @@ Open these files and identify their roles:
 - `modules/emio_camera_observation.py`
 - `modules/imitation_data.py`
 - `modules/imitation_policy.py`
-
 :::
 
 ::::
 #include(assets/labs/24786_project_pick_and_place_with_pose_estimation/sections/1_task_overview.md)
+#include(assets/labs/24786_project_pick_and_place_with_pose_estimation/sections/1b_implicit_behavioral_cloning_primer.md)
 #include(assets/labs/24786_project_pick_and_place_with_pose_estimation/sections/2_watch_expert.md)
 #include(assets/labs/24786_project_pick_and_place_with_pose_estimation/sections/3_collect_expert_demonstrations.md)
 #include(assets/labs/24786_project_pick_and_place_with_pose_estimation/sections/4_inspect_episode_format.md)

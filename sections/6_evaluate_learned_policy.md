@@ -36,11 +36,7 @@ Saved outputs:
 By default evaluation uses:
 - the same 17D geometric state vector used during state-only training
 - the same fixed place target used during collection
-- no camera input is required unless you want live tracker updates or rollout image logging
-
-To evaluate with the camera attached, add:
-- `--real-rgb-observation`
-- `--camera-tracking`
+- no camera input is required
 
 ::: exercise
 **Exercise:**
