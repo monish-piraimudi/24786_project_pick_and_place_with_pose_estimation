@@ -34,9 +34,9 @@ Saved outputs:
 - `data/results/il_pick_place/eval/metrics.json`
 
 By default evaluation uses:
-- simulated Emio-view RGB observations and no tracker, so it can run without attached hardware
-- the same 5D state vector used during hybrid training
+- the same 17D geometric state vector used during state-only training
 - the same fixed place target used during collection
+- no camera input is required unless you want live tracker updates or rollout image logging
 
 To evaluate with the camera attached, add:
 - `--real-rgb-observation`

@@ -1,4 +1,4 @@
-"""Implicit behavior-cloning helpers for the image-based pick-and-place policy."""
+"""Implicit behavior-cloning helpers for the motor-angle pick-and-place policy."""
 
 from __future__ import annotations
 
@@ -8,44 +8,32 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from modules.camera_observation import default_image_shape
-
 
 ACTION_DIM = 4
-DEFAULT_ACTION_BOUNDS = np.asarray(
-    [
-        [-5.0, 5.0],
-        [-5.0, 5.0],
-        [-5.0, 5.0],
-        [0.0, 1.0],
-    ],
-    dtype=np.float32,
-)
+MODEL_TYPE = "implicit_bc_motor_state_v1"
 DEFAULT_SEARCH_CONFIG = {
     "num_samples": 192,
     "num_elites": 24,
     "num_iters": 4,
     "min_std": 0.05,
 }
-HYBRID_MODEL_TYPE = "implicit_bc_hybrid"
+DEFAULT_WARM_START = True
+DEFAULT_WARM_START_STD_SCALE = 0.35
+DEFAULT_ACTION_SMOOTHING_ALPHA = 0.35
 
 
 class ImplicitBCPolicy(nn.Module):
-    """Energy model over `(observation, action)` pairs."""
+    """State-only energy model over `(state, action)` pairs."""
 
-    def __init__(self, input_channels: int = 3, action_dim: int = ACTION_DIM, state_dim: int = 0):
+    def __init__(self, state_dim: int, action_dim: int = ACTION_DIM):
         super().__init__()
         self.state_dim = int(state_dim)
-        self.image_encoder = nn.Sequential(
-            nn.Conv2d(input_channels, 32, kernel_size=5, stride=2, padding=2),
+        if self.state_dim <= 0:
+            raise ValueError("Motor-angle implicit BC requires a positive state_dim.")
+        self.state_encoder = nn.Sequential(
+            nn.Linear(self.state_dim, 64),
             nn.ReLU(),
-            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
-            nn.ReLU(),
-            nn.AdaptiveAvgPool2d((4, 4)),
-            nn.Flatten(),
-            nn.Linear(128 * 4 * 4, 256),
+            nn.Linear(64, 64),
             nn.ReLU(),
         )
         self.action_encoder = nn.Sequential(
@@ -54,33 +42,19 @@ class ImplicitBCPolicy(nn.Module):
             nn.Linear(128, 128),
             nn.ReLU(),
         )
-        if self.state_dim > 0:
-            self.state_encoder = nn.Sequential(
-                nn.Linear(self.state_dim, 64),
-                nn.ReLU(),
-                nn.Linear(64, 64),
-                nn.ReLU(),
-            )
-            observation_dim = 256 + 64
-        else:
-            self.state_encoder = None
-            observation_dim = 256
         self.energy_head = nn.Sequential(
-            nn.Linear(observation_dim + 128, 256),
+            nn.Linear(64 + 128, 256),
             nn.ReLU(),
             nn.Linear(256, 1),
         )
 
-    def encode_observation(self, x: torch.Tensor, state: torch.Tensor | None = None) -> torch.Tensor:
-        image_embed = self.image_encoder(x)
-        if self.state_dim == 0:
-            return image_embed
+    def encode_observation(self, state: torch.Tensor) -> torch.Tensor:
         if state is None:
-            raise ValueError("Hybrid policy requires a state observation tensor.")
-        return torch.cat([image_embed, self.state_encoder(state)], dim=-1)
+            raise ValueError("Motor-angle implicit BC requires a state observation tensor.")
+        return self.state_encoder(state)
 
-    def forward(self, x: torch.Tensor, action: torch.Tensor, state: torch.Tensor | None = None) -> torch.Tensor:
-        obs_embed = self.encode_observation(x, state)
+    def forward(self, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+        obs_embed = self.encode_observation(state)
         action_embed = self.action_encoder(action)
         return self.energy_head(torch.cat([obs_embed, action_embed], dim=-1)).squeeze(-1)
 
@@ -90,8 +64,6 @@ class ImplicitBCPolicy(nn.Module):
 
 
 def _normalize_action_bounds(action_bounds) -> np.ndarray:
-    if action_bounds is None:
-        return DEFAULT_ACTION_BOUNDS.copy()
     array = np.asarray(action_bounds, dtype=np.float32).reshape(ACTION_DIM, 2)
     lower = np.minimum(array[:, 0], array[:, 1])
     upper = np.maximum(array[:, 0], array[:, 1])
@@ -101,19 +73,19 @@ def _normalize_action_bounds(action_bounds) -> np.ndarray:
 def save_policy_checkpoint(
     file_path: str | Path,
     model: nn.Module,
-    image_mean: np.ndarray,
-    image_std: np.ndarray,
-    image_shape: tuple[int, int, int] | None = None,
     metadata: dict | None = None,
 ) -> None:
-    """Save the trained implicit policy with image normalization stats."""
+    """Save the trained motor-angle implicit policy."""
 
     file_path = Path(file_path)
     file_path.parent.mkdir(parents=True, exist_ok=True)
     metadata = dict(metadata or {})
-    metadata.setdefault("model_type", "implicit_bc")
-    metadata.setdefault("action_bounds", DEFAULT_ACTION_BOUNDS.tolist())
+    metadata.setdefault("model_type", MODEL_TYPE)
+    metadata.setdefault("action_bounds", [[-np.pi, np.pi]] * ACTION_DIM)
     metadata.setdefault("search_config", dict(DEFAULT_SEARCH_CONFIG))
+    metadata.setdefault("warm_start", DEFAULT_WARM_START)
+    metadata.setdefault("warm_start_std_scale", DEFAULT_WARM_START_STD_SCALE)
+    metadata.setdefault("action_smoothing_alpha", DEFAULT_ACTION_SMOOTHING_ALPHA)
     metadata.setdefault("state_dim", int(getattr(model, "state_dim", 0)))
     metadata.setdefault("state_feature_names", [])
     metadata.setdefault("state_mean", [])
@@ -121,9 +93,6 @@ def save_policy_checkpoint(
     torch.save(
         {
             "state_dict": model.state_dict(),
-            "image_mean": np.asarray(image_mean, dtype=np.float32),
-            "image_std": np.asarray(image_std, dtype=np.float32),
-            "image_shape": tuple(image_shape or default_image_shape()),
             "metadata": metadata,
         },
         file_path,
@@ -133,61 +102,55 @@ def save_policy_checkpoint(
 def load_policy_checkpoint(
     file_path: str | Path,
     device: str | torch.device = "cpu",
-) -> tuple[ImplicitBCPolicy, np.ndarray, np.ndarray, tuple[int, int, int], dict]:
-    """Load a trained implicit BC policy and its preprocessing metadata."""
+) -> tuple[ImplicitBCPolicy, dict]:
+    """Load a trained motor-angle implicit BC policy."""
 
     checkpoint = torch.load(file_path, map_location=device, weights_only=False)
     metadata = dict(checkpoint.get("metadata", {}))
-    model_type = metadata.get("model_type", "implicit_bc")
-    if model_type not in {"implicit_bc", HYBRID_MODEL_TYPE}:
+    model_type = metadata.get("model_type")
+    if model_type != MODEL_TYPE:
         raise ValueError(
-            f"Checkpoint model_type={model_type!r} is not supported by the implicit BC runtime."
+            f"Checkpoint model_type={model_type!r} is not supported. Expected {MODEL_TYPE!r}."
         )
 
-    image_shape = tuple(checkpoint.get("image_shape") or default_image_shape())
-    state_dim = 0 if model_type == "implicit_bc" else int(metadata.get("state_dim", 0))
-    model = ImplicitBCPolicy(input_channels=int(image_shape[2]), state_dim=state_dim)
+    state_dim = int(metadata.get("state_dim", 0))
+    model = ImplicitBCPolicy(state_dim=state_dim)
     model.load_state_dict(checkpoint["state_dict"])
     model.to(device)
     model.eval()
-
-    image_mean = np.asarray(checkpoint["image_mean"], dtype=np.float32)
-    image_std = np.asarray(checkpoint["image_std"], dtype=np.float32)
-    return model, image_mean, image_std, image_shape, metadata
+    return model, metadata
 
 
 class ImplicitBCAgent:
-    """Image-policy inference wrapper using CEM over bounded 4D actions."""
+    """State-only motor-angle implicit BC inference wrapper using CEM."""
 
     def __init__(
         self,
         model: ImplicitBCPolicy,
-        image_mean: np.ndarray,
-        image_std: np.ndarray,
-        image_shape: tuple[int, int, int] | None = None,
-        action_bounds: np.ndarray | None = None,
+        action_bounds: np.ndarray,
         search_config: dict | None = None,
         state_mean: np.ndarray | None = None,
         state_std: np.ndarray | None = None,
         state_feature_names: list[str] | tuple[str, ...] | None = None,
+        warm_start: bool = DEFAULT_WARM_START,
+        warm_start_std_scale: float = DEFAULT_WARM_START_STD_SCALE,
+        action_smoothing_alpha: float = DEFAULT_ACTION_SMOOTHING_ALPHA,
         device: str | torch.device = "cpu",
     ):
         self.model = model
-        self.image_mean = np.asarray(image_mean, dtype=np.float32)
-        self.image_std = np.asarray(image_std, dtype=np.float32)
-        self.image_shape = tuple(image_shape or default_image_shape())
         self.action_bounds = _normalize_action_bounds(action_bounds)
         self.search_config = dict(DEFAULT_SEARCH_CONFIG)
         if search_config is not None:
             self.search_config.update(search_config)
         self.state_dim = int(getattr(model, "state_dim", 0))
         self.state_feature_names = list(state_feature_names or [])
-        if self.state_dim > 0:
-            self.state_mean = np.asarray(state_mean, dtype=np.float32).reshape(self.state_dim)
-            self.state_std = np.asarray(state_std, dtype=np.float32).reshape(self.state_dim)
-        else:
-            self.state_mean = np.zeros((0,), dtype=np.float32)
-            self.state_std = np.ones((0,), dtype=np.float32)
+        self.state_mean = np.asarray(state_mean, dtype=np.float32).reshape(self.state_dim)
+        self.state_std = np.asarray(state_std, dtype=np.float32).reshape(self.state_dim)
+        self.warm_start = bool(warm_start)
+        self.warm_start_std_scale = float(warm_start_std_scale)
+        self.action_smoothing_alpha = float(np.clip(action_smoothing_alpha, 0.0, 1.0))
+        self.previous_action: np.ndarray | None = None
+        self.model_type = MODEL_TYPE
         self.device = torch.device(device)
         self.model.to(self.device)
         self.model.eval()
@@ -198,40 +161,59 @@ class ImplicitBCAgent:
         file_path: str | Path,
         device: str | torch.device = "cpu",
     ) -> "ImplicitBCAgent":
-        model, image_mean, image_std, image_shape, metadata = load_policy_checkpoint(file_path, device=device)
+        model, metadata = load_policy_checkpoint(file_path, device=device)
         return cls(
             model=model,
-            image_mean=image_mean,
-            image_std=image_std,
-            image_shape=image_shape,
             action_bounds=metadata.get("action_bounds"),
             search_config=metadata.get("search_config"),
             state_mean=metadata.get("state_mean"),
             state_std=metadata.get("state_std"),
             state_feature_names=metadata.get("state_feature_names"),
+            warm_start=metadata.get("warm_start", DEFAULT_WARM_START),
+            warm_start_std_scale=metadata.get("warm_start_std_scale", DEFAULT_WARM_START_STD_SCALE),
+            action_smoothing_alpha=metadata.get("action_smoothing_alpha", DEFAULT_ACTION_SMOOTHING_ALPHA),
             device=device,
         )
 
-    def _prepare_image_tensor(self, observation: np.ndarray) -> torch.Tensor:
-        image = np.asarray(observation, dtype=np.float32)
-        if image.ndim != 3:
-            raise ValueError(f"Expected HWC image observation, got shape {image.shape}")
-        if tuple(image.shape) != self.image_shape:
-            raise ValueError(f"Expected image shape {self.image_shape}, got {tuple(image.shape)}")
-        if float(np.max(image)) > 1.5:
-            image = image / 255.0
-        image = (image - self.image_mean.reshape(1, 1, -1)) / self.image_std.reshape(1, 1, -1)
-        image = np.transpose(image, (2, 0, 1)).astype(np.float32)
-        return torch.from_numpy(image).to(self.device).unsqueeze(0)
+    def _clip_action(self, action: np.ndarray) -> np.ndarray:
+        action = np.asarray(action, dtype=np.float32).reshape(ACTION_DIM)
+        return np.clip(action, self.action_bounds[:, 0], self.action_bounds[:, 1]).astype(np.float32)
 
-    def _prepare_state_tensor(self, state_observation: np.ndarray | None) -> torch.Tensor | None:
-        if self.state_dim == 0:
-            return None
-        if state_observation is None:
-            raise ValueError(
-                "Checkpoint requires state_observation with features "
-                f"{self.state_feature_names or list(range(self.state_dim))}."
-            )
+    def reset_rollout(self) -> None:
+        self.previous_action = None
+
+    def set_previous_action(self, executed_action: np.ndarray | None) -> None:
+        if executed_action is None:
+            self.previous_action = None
+            return
+        self.previous_action = self._clip_action(executed_action)
+
+    def smooth_action(self, raw_action: np.ndarray) -> np.ndarray:
+        raw_action = self._clip_action(raw_action)
+        if self.previous_action is None:
+            return raw_action
+        alpha = self.action_smoothing_alpha
+        smoothed = alpha * raw_action + (1.0 - alpha) * self.previous_action
+        return self._clip_action(smoothed)
+
+    def _initial_search_distribution(self, warm_start_action: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
+        lower = self.action_bounds[:, 0]
+        upper = self.action_bounds[:, 1]
+        mean = 0.5 * (lower + upper)
+        std = 0.5 * (upper - lower)
+
+        if self.warm_start:
+            if warm_start_action is None:
+                warm_start_action = self.previous_action
+            if warm_start_action is not None:
+                mean = self._clip_action(warm_start_action)
+                std = std * self.warm_start_std_scale
+
+        min_std = float(self.search_config["min_std"])
+        std = np.maximum(std, min_std).astype(np.float32)
+        return mean.astype(np.float32), std
+
+    def _prepare_state_tensor(self, state_observation: np.ndarray) -> torch.Tensor:
         state = np.asarray(state_observation, dtype=np.float32).reshape(-1)
         if state.shape[0] != self.state_dim:
             raise ValueError(f"Expected state dim {self.state_dim}, got {state.shape[0]}")
@@ -240,22 +222,23 @@ class ImplicitBCAgent:
 
     def score_actions(
         self,
-        observation: np.ndarray,
+        state_observation: np.ndarray,
         actions: np.ndarray,
-        state_observation: np.ndarray | None = None,
     ) -> np.ndarray:
-        image_tensor = self._prepare_image_tensor(observation)
         state_tensor = self._prepare_state_tensor(state_observation)
         actions = np.asarray(actions, dtype=np.float32).reshape(-1, ACTION_DIM)
         with torch.inference_mode():
-            obs_embed = self.model.encode_observation(image_tensor, state_tensor)
+            obs_embed = self.model.encode_observation(state_tensor)
             obs_embed = obs_embed.repeat(actions.shape[0], 1)
             action_tensor = torch.from_numpy(actions).to(self.device)
             energy = self.model.forward_with_embedding(obs_embed, action_tensor).cpu().numpy()
         return energy.astype(np.float32)
 
-    def predict(self, observation: np.ndarray, state_observation: np.ndarray | None = None) -> np.ndarray:
-        image_tensor = self._prepare_image_tensor(observation)
+    def predict(
+        self,
+        state_observation: np.ndarray,
+        warm_start_action: np.ndarray | None = None,
+    ) -> np.ndarray:
         state_tensor = self._prepare_state_tensor(state_observation)
         lower = self.action_bounds[:, 0]
         upper = self.action_bounds[:, 1]
@@ -264,19 +247,15 @@ class ImplicitBCAgent:
         num_iters = int(self.search_config["num_iters"])
         min_std = float(self.search_config["min_std"])
 
-        mean = 0.5 * (lower + upper)
-        std = 0.5 * (upper - lower)
+        mean, std = self._initial_search_distribution(warm_start_action=warm_start_action)
         best_action = mean.copy()
         best_energy = np.inf
 
         with torch.inference_mode():
-            obs_embed = self.model.encode_observation(image_tensor, state_tensor)
-            for search_iter in range(num_iters):
-                if search_iter == 0:
-                    candidates = np.random.uniform(lower, upper, size=(num_samples, ACTION_DIM)).astype(np.float32)
-                else:
-                    candidates = np.random.normal(mean, std, size=(num_samples, ACTION_DIM)).astype(np.float32)
-                    candidates = np.clip(candidates, lower, upper)
+            obs_embed = self.model.encode_observation(state_tensor)
+            for _ in range(num_iters):
+                candidates = np.random.normal(mean, std, size=(num_samples, ACTION_DIM)).astype(np.float32)
+                candidates = np.clip(candidates, lower, upper)
 
                 obs_embed_batch = obs_embed.repeat(candidates.shape[0], 1)
                 action_tensor = torch.from_numpy(candidates).to(self.device)
@@ -290,4 +269,4 @@ class ImplicitBCAgent:
                     best_energy = float(energies[elite_idx[0]])
                     best_action = candidates[elite_idx[0]].copy()
 
-        return np.clip(best_action, lower, upper).astype(np.float32)
+        return self._clip_action(best_action)

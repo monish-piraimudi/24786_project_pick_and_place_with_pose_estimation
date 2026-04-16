@@ -25,20 +25,32 @@ Important saved keys include:
 - `total_success`
 
 For learning:
-- policy input is `observation`
-- policy input also includes `state_observation`
+- policy input is `state_observation`
 - training target is `action`
 
 In this version of the lab:
-- `observation` is an RGB image with shape `[N, H, W, 3]`
-- `state_observation` has shape `[N, 5]`
+- `observation` may be present as an RGB image with shape `[N, H, W, 3]`
+- `state_observation` has shape `[N, 17]`
+
+The `state_observation` includes:
+- TCP position in `x/y/z`
+- cube position in `x/y/z`
+- goal position in `x/y/z`
+- TCP-to-cube delta in `x/y/z`
+- cube-to-goal delta in `x/y/z`
+- normalized gripper opening
+- held flag
+
+Action logging separates:
+- `action`: the raw policy proposal or expert target action
+- `executed_action`: the smoothed and clipped command actually sent to the controller
 
 In `modules/imitation_data.py`:
 - `EpisodeRecorder` stores one rollout
 - `load_episode_paths(...)` finds saved episodes
 - `split_episode_paths(...)` splits by episode
 - `flatten_episode_dataset(...)` concatenates step data after splitting
-- `flatten_hybrid_episode_dataset(...)` concatenates image/state/action step data after splitting
+- `flatten_state_episode_dataset(...)` concatenates state/action step data after splitting
 - `aggregate_rollout_metrics(...)` summarizes closed-loop performance
 
 Why split by episode instead of by timestep?

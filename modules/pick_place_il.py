@@ -22,13 +22,11 @@ from modules.pick_place_policy_shared import (
     MAX_EPISODE_STEPS,
     PHASE_NAMES,
     advance_phase,
-    apply_policy_action,
+    apply_policy_motor_action,
     build_state_observation,
     phase_opening,
     phase_target,
-    render_observation,
 )
-from modules.sim_emio_camera_observation import SimEmioCameraConfig, SimEmioCameraObservationSource
 
 
 _RUNTIME_TASK_TUNING = None
@@ -609,7 +607,6 @@ class PolicyInspectController(Sofa.Core.Controller):
         self.policy_path = self._resolve_policy_path(policy_path)
         self.policy_agent = None
         self.camera_source = None
-        self.sim_camera_source = None
         self.handles = {
             "root": root,
             "demo": demo,
@@ -618,8 +615,8 @@ class PolicyInspectController(Sofa.Core.Controller):
             "tcp_mo": tcp_mo,
             "block_mo": block_mo,
             "gripper_state": gripper_state,
+            "motor_actuators": [root.Simulation.Emio.getChild(f"Motor{i}").JointActuator for i in range(4)],
             "camera_source": None,
-            "sim_camera_source": None,
             "tuning": tuning,
         }
         self.is_running = False
@@ -677,14 +674,6 @@ class PolicyInspectController(Sofa.Core.Controller):
                     raise RuntimeError("Failed to open EmioCamera for policy inspection.")
                 self.handles["camera_source"] = self.camera_source
 
-            if not self.real_rgb_observation:
-                self.sim_camera_source = SimEmioCameraObservationSource(
-                    self.handles,
-                    SimEmioCameraConfig(image_shape=self.image_shape),
-                )
-                if not self.sim_camera_source.open():
-                    raise RuntimeError("Failed to initialize simulated Emio camera for policy inspection.")
-                self.handles["sim_camera_source"] = self.sim_camera_source
         except Exception as exc:
             if self.camera_source is not None:
                 try:
@@ -693,13 +682,6 @@ class PolicyInspectController(Sofa.Core.Controller):
                     pass
             self.camera_source = None
             self.handles["camera_source"] = None
-            if self.sim_camera_source is not None:
-                try:
-                    self.sim_camera_source.close()
-                except Exception:
-                    pass
-            self.sim_camera_source = None
-            self.handles["sim_camera_source"] = None
             if not self._load_error_logged:
                 Sofa.msg_error(
                     "PolicyInspectController",
@@ -712,10 +694,6 @@ class PolicyInspectController(Sofa.Core.Controller):
         return True
 
     def cleanup(self):
-        if self.sim_camera_source is not None:
-            self.sim_camera_source.close()
-            self.sim_camera_source = None
-            self.handles["sim_camera_source"] = None
         if self.camera_source is not None:
             self.camera_source.close()
             self.camera_source = None
@@ -826,6 +804,8 @@ class PolicyInspectController(Sofa.Core.Controller):
         self.demo.reset_demo_state(current_time=float(self.root.time.value))
         self.demo._set_target_position(phase_target(self.demo, self.phase))
         self.demo._set_gripper_opening(phase_opening(self.demo, self.phase))
+        if self.policy_agent is not None:
+            self.policy_agent.reset_rollout()
         self.is_running = True
         self.root.policyInspectActive.value = True
         self._auto_start_pending = False
@@ -853,16 +833,13 @@ class PolicyInspectController(Sofa.Core.Controller):
             self._stop_rollout("camera_init_failed")
             return
 
-        observation = None
         if self.camera_source is not None:
             try:
-                camera_frame, trackers = self.camera_source.update()
-                if self.real_rgb_observation:
-                    observation = camera_frame
+                _camera_frame, trackers = self.camera_source.update()
                 if self.camera_tracking:
                     self._update_camera_cube(trackers)
             except Exception:
-                observation = None
+                pass
 
         selected_cube = self._selected_cube_key()
         slider_changed = self._last_cube_selector is not None and selected_cube != self._last_cube_selector
@@ -896,15 +873,16 @@ class PolicyInspectController(Sofa.Core.Controller):
                 self._stop_rollout("max_steps_reached")
                 return
 
-            if observation is None:
-                observation = render_observation(
-                    self.handles,
-                    self.phase,
-                    self.image_shape,
-                )
-            state_observation = build_state_observation(self.handles, self.phase)
-            action = np.asarray(self.policy_agent.predict(observation, state_observation), dtype=np.float32)
-            apply_policy_action(self.handles, action)
+            state_observation = build_state_observation(
+                self.handles,
+                self.phase,
+            )
+            action = np.asarray(self.policy_agent.predict(state_observation), dtype=np.float32)
+            smoothed_action = self.policy_agent.smooth_action(action)
+            self.demo._set_target_position(phase_target(self.demo, self.phase))
+            self.demo._set_gripper_opening(phase_opening(self.demo, self.phase))
+            executed_action = apply_policy_motor_action(self.handles, smoothed_action)
+            self.policy_agent.set_previous_action(executed_action)
             self.phase_step += 1
             self.step_count += 1
 

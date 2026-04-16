@@ -16,9 +16,12 @@ from modules.pick_place_policy_shared import (
     PHASE_NAMES,
     advance_phase,
     apply_expert_target,
-    apply_policy_action,
+    apply_policy_motor_action,
     build_state_observation,
-    expert_action,
+    current_motor_angles,
+    motor_action_bounds,
+    phase_opening,
+    phase_target,
     render_observation,
     rigid_pose,
     rigid_xyz,
@@ -143,6 +146,7 @@ def _tracker_cube_state(trackers: np.ndarray, cube_marker_offset_mm: np.ndarray)
 
 
 def _resolve_handles(root, tuning: dict[str, float | np.ndarray]) -> dict:
+    motor_actuators = [root.Simulation.Emio.getChild(f"Motor{i}").JointActuator for i in range(4)]
     handles = {
         "root": root,
         "demo": root.getObject("AutoPickAndPlaceDemo"),
@@ -153,6 +157,7 @@ def _resolve_handles(root, tuning: dict[str, float | np.ndarray]) -> dict:
         "pick_marker_mo": root.Modelling.PickMarker.getMechanicalState(),
         "gripper_state": root.Simulation.Emio.centerpart.Effector.getMechanicalState(),
         "gripper_opening": root.Simulation.Emio.centerpart.Effector.Distance.DistanceMapping.restLengths,
+        "motor_actuators": motor_actuators,
         "camera_source": None,
         "sim_camera_source": None,
         "tuning": tuning,
@@ -162,6 +167,11 @@ def _resolve_handles(root, tuning: dict[str, float | np.ndarray]) -> dict:
         ),
     }
     return handles
+
+
+def resolve_default_motor_action_bounds(config: PickPlaceTaskConfig | None = None) -> np.ndarray:
+    root, handles = _build_scene(config or PickPlaceTaskConfig(mode="collect"))
+    return motor_action_bounds(handles)
 
 
 def _set_block_pose(handles: dict, xyz: np.ndarray) -> None:
@@ -289,10 +299,13 @@ def run_single_episode(config: PickPlaceTaskConfig) -> dict:
                 "Relative --policy-path values are resolved from this lab folder."
             )
         policy_agent = ImplicitBCAgent.from_checkpoint(policy_path)
+        policy_agent.reset_rollout()
 
     recorder = None
     if config.log_episode and config.output_dir:
         recorder = EpisodeRecorder(config.output_dir, config.episode_id)
+    requires_logged_observation = recorder is not None
+    requires_observation = bool(config.real_rgb_observation or requires_logged_observation)
 
     camera_source = None
     sim_camera_source = None
@@ -308,7 +321,7 @@ def run_single_episode(config: PickPlaceTaskConfig) -> dict:
     try:
         camera_source = _open_camera_source(config)
         handles["camera_source"] = camera_source
-        if not config.real_rgb_observation:
+        if not config.real_rgb_observation and requires_logged_observation:
             sim_camera_source = _open_sim_camera_source(config, handles)
             handles["sim_camera_source"] = sim_camera_source
 
@@ -358,7 +371,7 @@ def run_single_episode(config: PickPlaceTaskConfig) -> dict:
                     _sync_task_to_cube(handles, camera_cube_position)
                     camera_status_message = "cube marker temporarily lost"
 
-            if observation is None:
+            if observation is None and requires_observation:
                 observation = render_observation(
                     handles,
                     phase,
@@ -372,46 +385,53 @@ def run_single_episode(config: PickPlaceTaskConfig) -> dict:
             state_observation = build_state_observation(
                 handles,
                 phase,
+                cube_position=camera_cube_position,
                 gripper_opening=current_gripper_opening,
                 held_flag=current_held_flag,
             )
 
             if config.mode in {"expert", "collect"}:
                 action = apply_expert_target(handles, phase)
-                executed_action = action
+                executed_action = action.copy()
             else:
-                action = np.asarray(policy_agent.predict(observation, state_observation), dtype=np.float32)
-                executed_action = apply_policy_action(handles, action)
+                action = np.asarray(policy_agent.predict(state_observation), dtype=np.float32)
+                smoothed_action = policy_agent.smooth_action(action)
+                handles["demo"]._set_target_position(phase_target(handles["demo"], phase))
+                handles["demo"]._set_gripper_opening(phase_opening(handles["demo"], phase))
+                executed_action = apply_policy_motor_action(handles, smoothed_action)
+                policy_agent.set_previous_action(executed_action)
 
             failure_phase = phase
 
             if recorder is not None:
-                recorder.append(
-                    observation=observation.astype(np.uint8),
-                    state_observation=state_observation.astype(np.float32),
-                    action=action.astype(np.float32),
-                    executed_action=executed_action.astype(np.float32),
-                    phase_index=np.int32(PHASE_INDEX[phase]),
-                    episode_step=np.int32(task_step),
-                    cube_pose=rigid_pose(handles["block_mo"]).astype(np.float32),
-                    tracked_cube_position=(
+                record = {
+                    "state_observation": state_observation.astype(np.float32),
+                    "action": action.astype(np.float32),
+                    "executed_action": executed_action.astype(np.float32),
+                    "phase_index": np.int32(PHASE_INDEX[phase]),
+                    "episode_step": np.int32(task_step),
+                    "cube_pose": rigid_pose(handles["block_mo"]).astype(np.float32),
+                    "tracked_cube_position": (
                         np.asarray(camera_cube_position, dtype=np.float32)
                         if camera_cube_position is not None
                         else np.full((3,), np.nan, dtype=np.float32)
                     ),
-                    object_position=np.asarray(handles["tuning"]["object_position"], dtype=np.float32),
-                    pick_position=np.asarray(handles["tuning"]["pick_position"], dtype=np.float32),
-                    target_position=np.asarray(handles["tuning"]["place_position"], dtype=np.float32),
-                    effector_pose=rigid_pose(handles["tcp_mo"]).astype(np.float32),
-                    gripper_opening=np.float32(current_gripper_opening),
-                    held_flag=np.int32(int(current_held_flag)),
-                    task_score=np.float32(root.taskScore.value),
-                    task_lifted=np.int32(int(root.taskLifted.value)),
-                    task_placed=np.int32(int(root.taskPlaced.value)),
-                    pick_success=np.int32(int(root.taskLifted.value)),
-                    place_success=np.int32(int(root.taskPlaced.value)),
-                    total_success=np.int32(int(root.taskLifted.value and root.taskPlaced.value)),
-                )
+                    "object_position": np.asarray(handles["tuning"]["object_position"], dtype=np.float32),
+                    "pick_position": np.asarray(handles["tuning"]["pick_position"], dtype=np.float32),
+                    "target_position": np.asarray(handles["tuning"]["place_position"], dtype=np.float32),
+                    "effector_pose": rigid_pose(handles["tcp_mo"]).astype(np.float32),
+                    "gripper_opening": np.float32(current_gripper_opening),
+                    "held_flag": np.int32(int(current_held_flag)),
+                    "task_score": np.float32(root.taskScore.value),
+                    "task_lifted": np.int32(int(root.taskLifted.value)),
+                    "task_placed": np.int32(int(root.taskPlaced.value)),
+                    "pick_success": np.int32(int(root.taskLifted.value)),
+                    "place_success": np.int32(int(root.taskPlaced.value)),
+                    "total_success": np.int32(int(root.taskLifted.value and root.taskPlaced.value)),
+                }
+                if observation is not None:
+                    record["observation"] = observation.astype(np.uint8)
+                recorder.append(**record)
 
             Sofa.Simulation.animate(root, config.control_dt)
             task_step += 1

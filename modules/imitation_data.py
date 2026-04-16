@@ -112,35 +112,27 @@ def flatten_episode_dataset(
     return np.concatenate(observations, axis=0), np.concatenate(actions, axis=0)
 
 
-def flatten_hybrid_episode_dataset(
+def flatten_state_episode_dataset(
     episode_paths: list[Path],
-    observation_key: str = "observation",
     state_key: str = "state_observation",
     action_key: str = "action",
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Flatten multiple trajectory files into image/state/action step-wise arrays."""
+) -> tuple[np.ndarray, np.ndarray]:
+    """Flatten multiple trajectory files into state/action step-wise arrays."""
 
-    observations = []
     state_observations = []
     actions = []
     for episode_path in episode_paths:
         with np.load(episode_path, allow_pickle=False) as episode:
-            observations.append(np.asarray(episode[observation_key], dtype=np.float32))
             state_observations.append(np.asarray(episode[state_key], dtype=np.float32))
             actions.append(np.asarray(episode[action_key], dtype=np.float32))
 
-    if not observations:
+    if not state_observations:
         return (
-            np.zeros((0, 0), dtype=np.float32),
             np.zeros((0, 0), dtype=np.float32),
             np.zeros((0, 0), dtype=np.float32),
         )
 
-    return (
-        np.concatenate(observations, axis=0),
-        np.concatenate(state_observations, axis=0),
-        np.concatenate(actions, axis=0),
-    )
+    return np.concatenate(state_observations, axis=0), np.concatenate(actions, axis=0)
 
 
 def write_manifest(entries: list[dict], file_path: str | Path) -> Path:

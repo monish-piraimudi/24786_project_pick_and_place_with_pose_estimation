@@ -7,7 +7,8 @@ The saved episodes now come from the same state-machine phase progression used a
 - the block spawn is sampled from a continuous tray workspace in X/Z
 - the pick location uses the same X/Z as the block
 - the place target stays fixed by default
-- the script records RGB observations, a 5D `state_observation`, expert 4D actions, executed actions, and tracker-assisted cube metadata at each step
+- the script records a 17D geometric `state_observation`, expert 4D motor-angle actions, executed actions, and tracker-assisted cube metadata at each step
+- RGB `observation` frames may also be saved for debugging and comparison, but the new state-only training path ignores them
 
 By default the workspace bounds are:
 - `x in [-35, 10]`

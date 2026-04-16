@@ -1,30 +1,31 @@
-:::: collapse Step 4: Train The Hybrid Policy
-## Step 4: Train The Hybrid Policy
+:::: collapse Step 4: Train The State-Only Policy
+## Step 4: Train The State-Only Policy
 
 `train_il_policy.py` trains an implicit behavior-cloning policy from the saved episodes.
 
 With the default collection settings, the learned policy sees:
 - varying pickup locations
 - one fixed placement target
-- the same RGB observation format at every timestep
-- a fixed-order 5D low-dimensional state vector at every timestep
+- a fixed-order 17D geometric state vector at every timestep
 
-Training expects newly saved hybrid episodes from this lab folder. If the dataset directory contains old legacy image-only episodes mixed with hybrid episodes, training stops with a clear error instead of silently skipping them.
+Training expects episodes with `state_observation` and `action`. Saved RGB observations may still be present for logging, but training ignores them.
 
 The training script:
 - loads episode files
 - splits them into train, validation, and test episodes
-- flattens each split into stepwise arrays
-- normalizes RGB observations channel-wise
-- normalizes the 5D state vector feature-wise
+- flattens each split into stepwise state/action arrays
+- normalizes the 17D state vector feature-wise
 - trains an energy model on positive expert actions plus sampled negative actions
-- saves the checkpoint with image normalization and state normalization statistics
+- saves the checkpoint with state normalization statistics plus CEM and smoothing metadata
 
-The current policy in `modules/imitation_policy.py` is hybrid and implicit:
-- input shape `[H, W, 3]`
-- state shape `[5]`
-- action dimension `4`
-- inference selects the action with minimum predicted energy over a bounded search distribution
+The current policy in `modules/imitation_policy.py` is state-only and implicit:
+- state shape `[17]`
+- action dimension `4` of absolute motor angles
+- inference selects the action with minimum predicted energy over a bounded CEM search distribution
+- CEM warm-starts from the previous executed action
+- the applied command is an EMA-smoothed version of the raw policy proposal
+
+The only supported checkpoint type is `implicit_bc_motor_state_v1`.
 
 Train the policy:
 
@@ -44,7 +45,7 @@ Output:
 ::: exercise
 **Exercise:**
 
-Run training and inspect the printed losses. Why must the exact same image normalization, state normalization, and action bounds be reused at inference time?
+Run training and inspect the printed losses. Why must the exact same state normalization and action bounds be reused at inference time?
 
 :::
 

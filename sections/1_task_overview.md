@@ -14,11 +14,11 @@ The current pipeline is split across a few small modules:
 - `modules/emio_camera_observation.py`
   Opens `EmioCamera`, updates frames and trackers, and provides real RGB observations plus tracker positions.
 - `modules/sim_emio_camera_observation.py`
-  Provides the default simulation-only RGB observation path by rendering an Emio-like perspective camera view when real RGB is disabled.
+  Provides optional simulation-only RGB rollout logging by rendering an Emio-like perspective camera view when real RGB is disabled.
 - `modules/imitation_data.py`
-  Saves episodes, loads hybrid image/state datasets, splits by episode, and computes rollout metrics.
+  Saves episodes, loads state/action datasets, splits by episode, and computes rollout metrics.
 - `modules/imitation_policy.py`
-  Defines the hybrid implicit BC energy model, action search, and checkpoint save/load helpers.
+  Defines the motor-angle state-only implicit BC energy model, action search, and checkpoint save/load helpers.
 
 The scene is the source of truth. The runtime scripts do not define a separate task; they only drive the scene for:
 - collection

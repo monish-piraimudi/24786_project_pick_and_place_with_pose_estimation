@@ -3,7 +3,7 @@
 
 Step 6 now supports two interactive GUI policy-inspection modes inside the same SOFA scene:
 - a default inspection scene that does not require camera hardware
-- an optional live-camera inspection scene for real RGB policy input
+- an optional live-camera inspection scene for tracker-assisted cube updates
 
 The recommended comparison flow is:
 1. watch the scripted expert in the default GUI scene
@@ -24,13 +24,12 @@ Use the default `runSofa` button below to open the camera-free learned-policy sc
 
 This default scene:
 - does not require an attached Emio camera
-- uses the simulated Emio-view observation path
-- computes the same 5D `state_observation` used during training
+- computes the same 17D `state_observation` used during training
 - keeps the place target fixed
 - starts the learned-policy rollout automatically when the scene opens
 - lets you move the cube in the scene and rerun after each rollout
 
-If you have a camera attached and want live RGB policy input, use this second scene:
+If you have a camera attached and want tracker-assisted inspection, use this second scene:
 
 #runsofa-button("assets/labs/24786_project_pick_and_place_with_pose_estimation/policy_inspect_camera_scene.py")
 
@@ -42,9 +41,9 @@ If you have a camera attached and want live RGB policy input, use this second sc
 Inside the live-camera GUI:
 - keep the place target fixed
 - the learned-policy rollout starts automatically when the scene opens
-- the policy consumes live RGB frames from the Emio camera
-- the policy also consumes the same 5D state vector built from the live scene state
+- the state-only policy consumes the same 17D geometric state vector built from the live scene state
 - tracker updates are used to align the cube pose and diagnostics with the observed object
+- live RGB frames remain useful for visual debugging
 - after the rollout finishes, move the cube to a new tray position to trigger another trial automatically
 
 Scripted evaluation is still useful for aggregate metrics. Example expert evaluation:

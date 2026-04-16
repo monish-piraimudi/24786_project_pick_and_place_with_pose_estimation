@@ -17,15 +17,29 @@ PHASE_NAMES = [
 ]
 PHASE_INDEX = {name: index for index, name in enumerate(PHASE_NAMES)}
 STATE_FEATURE_NAMES = (
-    "phase_index",
+    "tcp_x",
+    "tcp_y",
+    "tcp_z",
+    "cube_x",
+    "cube_y",
+    "cube_z",
+    "goal_x",
+    "goal_y",
+    "goal_z",
+    "tcp_to_cube_dx",
+    "tcp_to_cube_dy",
+    "tcp_to_cube_dz",
+    "cube_to_goal_dx",
+    "cube_to_goal_dy",
+    "cube_to_goal_dz",
     "gripper_opening",
     "held_flag",
-    "tcp_y",
-    "cube_y",
 )
+STATE_POSITION_CENTER_MM = np.asarray([0.0, -150.0, 0.0], dtype=np.float32)
+STATE_POSITION_SCALE_MM = np.asarray([60.0, 60.0, 60.0], dtype=np.float32)
+STATE_DELTA_SCALE_MM = np.asarray([50.0, 60.0, 50.0], dtype=np.float32)
 
 ACTION_DIM = 4
-ACTION_LIMIT_MM = 5.0
 POSE_TOLERANCE_MM = 8.0
 CLOSE_GRIPPER_TIMEOUT_STEPS = 18
 OPEN_GRIPPER_TIMEOUT_STEPS = 10
@@ -54,10 +68,6 @@ def quaternion_to_yaw_degrees(quaternion: np.ndarray) -> float:
     quaternion = np.asarray(quaternion, dtype=np.float32)
     sin_half = float(np.clip(quaternion[1], -1.0, 1.0))
     return float(np.degrees(2.0 * np.arcsin(sin_half)))
-
-
-def clip_delta(delta: np.ndarray) -> np.ndarray:
-    return np.clip(np.asarray(delta, dtype=np.float32), -ACTION_LIMIT_MM, ACTION_LIMIT_MM)
 
 
 def phase_target(demo, phase: str) -> np.ndarray:
@@ -125,8 +135,9 @@ def build_state_observation(
     gripper_opening: float | None = None,
     held_flag: float | None = None,
 ) -> np.ndarray:
+    del phase
     tuning = handles["tuning"]
-    demo = handles["demo"]
+    tcp_position = rigid_xyz(handles["tcp_mo"])
 
     if cube_position is None:
         cube_position = rigid_xyz(handles["block_mo"])
@@ -141,24 +152,33 @@ def build_state_observation(
     opening_min = float(tuning["gripper_opening_min"])
     opening_max = float(tuning["gripper_opening_max"])
     opening_span = max(1e-6, opening_max - opening_min)
-    phase_value = float(PHASE_INDEX[phase]) / max(1, len(PHASE_NAMES) - 1)
     opening_value = float(np.clip((float(gripper_opening) - opening_min) / opening_span, 0.0, 1.0))
-
-    base_y = float(np.asarray(tuning["object_position"], dtype=np.float32)[1])
-    height_span = max(
-        1.0,
-        float(demo.hover_lift_height) + max(abs(float(demo.pick_height_offset)), abs(float(demo.place_height_offset))),
-    )
-    tcp_y = float((rigid_xyz(handles["tcp_mo"])[1] - base_y) / height_span)
-    cube_y = float((cube_position[1] - base_y) / height_span)
+    goal_position = np.asarray(tuning["place_position"], dtype=np.float32).reshape(-1)
+    tcp_to_cube_delta = (cube_position - tcp_position) / STATE_DELTA_SCALE_MM
+    cube_to_goal_delta = (goal_position - cube_position) / STATE_DELTA_SCALE_MM
+    normalized_tcp = (tcp_position - STATE_POSITION_CENTER_MM) / STATE_POSITION_SCALE_MM
+    normalized_cube = (cube_position - STATE_POSITION_CENTER_MM) / STATE_POSITION_SCALE_MM
+    normalized_goal = (goal_position - STATE_POSITION_CENTER_MM) / STATE_POSITION_SCALE_MM
 
     return np.asarray(
         [
-            phase_value,
+            float(normalized_tcp[0]),
+            float(normalized_tcp[1]),
+            float(normalized_tcp[2]),
+            float(normalized_cube[0]),
+            float(normalized_cube[1]),
+            float(normalized_cube[2]),
+            float(normalized_goal[0]),
+            float(normalized_goal[1]),
+            float(normalized_goal[2]),
+            float(tcp_to_cube_delta[0]),
+            float(tcp_to_cube_delta[1]),
+            float(tcp_to_cube_delta[2]),
+            float(cube_to_goal_delta[0]),
+            float(cube_to_goal_delta[1]),
+            float(cube_to_goal_delta[2]),
             opening_value,
             float(held_flag),
-            tcp_y,
-            cube_y,
         ],
         dtype=np.float32,
     )
@@ -226,11 +246,46 @@ def render_observation(
     return np.asarray(sim_camera_source.update(), dtype=np.uint8)
 
 
-def expert_action(handles: dict, phase: str) -> np.ndarray:
-    tcp_position = rigid_xyz(handles["tcp_mo"])
-    delta = clip_delta(phase_target(handles["demo"], phase) - tcp_position)
-    command = opening_to_command(handles["demo"], phase_opening(handles["demo"], phase))
-    return np.concatenate([delta, np.array([command], dtype=np.float32)]).astype(np.float32)
+def _actuator_scalar(actuator, attribute: str, fallback: float | None = None) -> float:
+    if not hasattr(actuator, attribute):
+        if fallback is None:
+            raise AttributeError(f"Actuator missing attribute {attribute!r}")
+        return float(fallback)
+    values = as_array(getattr(actuator, attribute)).reshape(-1)
+    if values.size == 0:
+        if fallback is None:
+            raise ValueError(f"Actuator attribute {attribute!r} is empty")
+        return float(fallback)
+    return float(values[0])
+
+
+def current_motor_angles(handles: dict) -> np.ndarray:
+    actuators = handles["motor_actuators"]
+    return np.asarray([_actuator_scalar(actuator, "angle", _actuator_scalar(actuator, "value", 0.0)) for actuator in actuators], dtype=np.float32)
+
+
+def motor_action_bounds(handles: dict) -> np.ndarray:
+    bounds = []
+    for actuator in handles["motor_actuators"]:
+        lower = _actuator_scalar(actuator, "minAngle", -np.pi)
+        upper = _actuator_scalar(actuator, "maxAngle", np.pi)
+        if lower > upper:
+            lower, upper = upper, lower
+        bounds.append([lower, upper])
+    return np.asarray(bounds, dtype=np.float32)
+
+
+def apply_policy_motor_action(handles: dict, action: np.ndarray) -> np.ndarray:
+    action = np.asarray(action, dtype=np.float32).reshape(-1)
+    actuators = handles["motor_actuators"]
+    if action.shape[0] != len(actuators):
+        raise ValueError(f"Expected action dim {len(actuators)}, got {action.shape[0]}")
+
+    bounds = motor_action_bounds(handles)
+    clipped = np.clip(action, bounds[:, 0], bounds[:, 1]).astype(np.float32)
+    for actuator, value in zip(actuators, clipped, strict=True):
+        actuator.value = float(value)
+    return clipped
 
 
 def apply_expert_target(handles: dict, phase: str) -> np.ndarray:
@@ -239,20 +294,4 @@ def apply_expert_target(handles: dict, phase: str) -> np.ndarray:
     opening = phase_opening(demo, phase)
     demo._set_target_position(target)
     demo._set_gripper_opening(opening)
-    return expert_action(handles, phase)
-
-
-def apply_policy_action(handles: dict, action: np.ndarray) -> np.ndarray:
-    action = np.asarray(action, dtype=np.float32).reshape(-1)
-    if action.shape[0] != ACTION_DIM:
-        raise ValueError(f"Expected action dim {ACTION_DIM}, got {action.shape[0]}")
-
-    demo = handles["demo"]
-    clipped_delta = clip_delta(action[:3])
-    gripper_command = float(np.clip(action[3], 0.0, 1.0))
-    # Policy deltas are defined in the current TCP frame to match expert labels.
-    current_tcp = rigid_xyz(handles["tcp_mo"])
-    next_target = current_tcp + clipped_delta
-    demo._set_target_position(next_target)
-    demo._set_gripper_opening(command_to_opening(demo, gripper_command))
-    return np.concatenate([clipped_delta, np.array([gripper_command], dtype=np.float32)]).astype(np.float32)
+    return current_motor_angles(handles)
