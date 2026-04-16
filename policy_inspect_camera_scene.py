@@ -25,7 +25,6 @@ def createScene(rootnode):
             "--no-real-rgb-observation",
             "--camera-tracking",
             "--camera-preview",
-            "--no-connection",
         ],
     )
 

@@ -17,7 +17,7 @@ The key idea is that one scene drives the whole pipeline:
 The recommended GUI workflow stays simulation-first:
 - launch one SOFA scene
 - inspect the learned rollout in simulation mode
-- use the Emio GUI's Simulation / Robot switch only when you intentionally want hardware execution outside the lab walkthrough
+- use the Emio GUI's Simulation / Robot switch only when you intentionally want hardware execution outside the lab walkthrough; the scene does not connect on launch
 
 From here, you can experiment with:
 - more demonstrations

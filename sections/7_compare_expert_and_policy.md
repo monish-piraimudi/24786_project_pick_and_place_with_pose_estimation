@@ -18,13 +18,13 @@ This default scene:
 - keeps the place target fixed
 - starts the learned-policy rollout automatically when the scene opens
 - lets you move the cube in the scene and rerun after each rollout
-- is intended to be used in simulation first
+- is intended to be used in simulation first, while still supporting the usual GUI connection toggle later if you explicitly switch to robot mode
 
 This matches the usual Emio GUI workflow used in the other labs:
 - launch one SOFA scene
 - press *Play* to start the simulation
 - stay in simulation mode while testing the learned policy
-- use the GUI's *Simulation / Robot* switch only if you later want to connect to the physical robot outside this lab step
+- use the GUI's *Simulation / Robot* switch only if you later want to connect to the physical robot outside this lab step; the scene stays simulation-first and does not auto-connect on launch
 
 Scripted evaluation is still useful for aggregate metrics. Example expert evaluation:
 
