@@ -1,4 +1,4 @@
-"""Canonical SOFA scene entrypoint for the Emio imitation-learning lab."""
+"""Compatibility scene wrapper for the Emio imitation-learning pick-and-place task."""
 
 from __future__ import annotations
 
@@ -11,11 +11,11 @@ PROJECT_DIR_STR = str(PROJECT_DIR)
 if PROJECT_DIR_STR not in sys.path:
     sys.path.insert(0, PROJECT_DIR_STR)
 
-from modules.pick_place_scene_entry import create_pick_place_scene
+from modules.pick_place_il import createScene as create_pick_place_scene
 
 
 def createScene(rootnode):
-    return create_pick_place_scene(rootnode, argv=["--no-camera-tracking"])
+    return create_pick_place_scene(rootnode)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,311 @@
+import argparse
+from pathlib import Path
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, TensorDataset
+
+from modules.imitation_data import flatten_state_episode_dataset, load_episode_paths, split_episode_paths
+from modules.imitation_policy import (
+    MODEL_TYPE,
+    ImplicitBCPolicy,
+    save_policy_checkpoint,
+)
+from modules.pick_place_il_runtime import resolve_default_motor_action_bounds
+from modules.pick_place_policy_shared import STATE_FEATURE_NAMES
+
+
+PROJECT_DIR = Path(__file__).resolve().parent
+NEGATIVE_SAMPLES = 63
+
+
+def _resolve_project_path(path: Path) -> Path:
+    return path if path.is_absolute() else (PROJECT_DIR / path)
+
+
+def _describe_episode_signature(path: Path) -> tuple[tuple[int, ...] | None, tuple[int, ...], tuple[int, ...]]:
+    with np.load(path, allow_pickle=False) as episode:
+        observation_shape = None
+        if "observation" in episode:
+            observation_shape = tuple(int(dim) for dim in episode["observation"].shape)
+        state_shape = tuple(int(dim) for dim in episode["state_observation"].shape)
+        action_shape = tuple(int(dim) for dim in episode["action"].shape)
+    return observation_shape, state_shape, action_shape
+
+
+def _validate_state_episode_paths(
+    episode_paths: list[Path],
+) -> tuple[tuple[int, ...] | None, tuple[int], tuple[int]]:
+    if not episode_paths:
+        raise SystemExit("Need at least 3 saved episodes to train/validate/test the policy")
+
+    incompatible = []
+    image_shapes = set()
+    state_shapes = set()
+    action_shapes = set()
+
+    for episode_path in episode_paths:
+        observation_shape, state_shape, action_shape = _describe_episode_signature(episode_path)
+        has_valid_observation = (
+            observation_shape is None or (len(observation_shape) == 4 and observation_shape[-1] == 3)
+        )
+        is_state_episode = (
+            has_valid_observation
+            and len(state_shape) == 2
+            and state_shape[-1] == len(STATE_FEATURE_NAMES)
+            and len(action_shape) == 2
+            and action_shape[-1] == 4
+        )
+        if not is_state_episode:
+            incompatible.append((episode_path.name, observation_shape, state_shape, action_shape))
+            continue
+        if observation_shape is not None:
+            image_shapes.add(observation_shape[1:])
+        state_shapes.add(state_shape[1:])
+        action_shapes.add(action_shape[1:])
+
+    if incompatible:
+        message_lines = [
+            "Dataset directory contains incompatible episodes. Motor-angle implicit BC training requires state observations and 4D motor actions.",
+            "Found the following incompatible episode shapes:",
+        ]
+        for episode_name, observation_shape, state_shape, action_shape in incompatible[:10]:
+            message_lines.append(
+                f"  {episode_name}: observation_shape={observation_shape} state_shape={state_shape} action_shape={action_shape}"
+            )
+        if len(incompatible) > 10:
+            message_lines.append(f"  ... and {len(incompatible) - 10} more")
+        message_lines.append(
+            "Recollect episodes with motor-action logging enabled or point --dataset-dir to a compatible dataset directory."
+        )
+        raise SystemExit("\n".join(message_lines))
+
+    if len(state_shapes) != 1 or len(action_shapes) != 1 or len(image_shapes) > 1:
+        raise SystemExit(
+            "Dataset directory contains inconsistent observation, state, or action shapes across episodes. "
+            f"image_shapes={sorted(image_shapes)} state_shapes={sorted(state_shapes)} action_shapes={sorted(action_shapes)}"
+        )
+
+    image_shape = next(iter(image_shapes)) if image_shapes else None
+    state_shape = next(iter(state_shapes))
+    action_shape = next(iter(action_shapes))
+    return image_shape, state_shape, action_shape
+
+
+def _make_loader(state_observations, actions, batch_size, shuffle):
+    dataset = TensorDataset(
+        torch.from_numpy(state_observations).float(),
+        torch.from_numpy(actions).float(),
+    )
+    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
+
+
+def _prepare_states(train_state, val_state, test_state):
+    state_dim = int(train_state.shape[1])
+    train_state = train_state.astype(np.float32)
+    val_state = val_state.astype(np.float32)
+    test_state = test_state.astype(np.float32)
+
+    state_mean = train_state.mean(axis=0).astype(np.float32)
+    state_std = train_state.std(axis=0).astype(np.float32)
+    state_std = np.where(state_std < 1e-6, 1.0, state_std).astype(np.float32)
+
+    def _norm(state):
+        if state.size == 0:
+            return np.zeros((0, state_dim), dtype=np.float32)
+        return ((state - state_mean.reshape(1, -1)) / state_std.reshape(1, -1)).astype(np.float32)
+
+    return _norm(train_state), _norm(val_state), _norm(test_state), state_mean, state_std
+
+
+def _sample_negative_actions(actions: torch.Tensor, action_bounds: np.ndarray, num_negatives: int) -> torch.Tensor:
+    batch_size, action_dim = actions.shape
+    lower = torch.as_tensor(action_bounds[:, 0], dtype=actions.dtype, device=actions.device)
+    upper = torch.as_tensor(action_bounds[:, 1], dtype=actions.dtype, device=actions.device)
+    global_samples = lower + (upper - lower) * torch.rand(
+        batch_size,
+        num_negatives,
+        action_dim,
+        device=actions.device,
+        dtype=actions.dtype,
+    )
+    local_noise = 0.15 * (upper - lower)
+    local_samples = actions.unsqueeze(1) + torch.randn_like(global_samples) * local_noise.view(1, 1, -1)
+    local_samples = torch.clamp(local_samples, lower.view(1, 1, -1), upper.view(1, 1, -1))
+    selector = torch.rand(batch_size, num_negatives, 1, device=actions.device, dtype=actions.dtype)
+    mixed = torch.where(selector < 0.5, global_samples, local_samples)
+    return mixed
+
+
+def _implicit_bc_loss(model, batch_state, batch_y, action_bounds: np.ndarray, num_negatives: int) -> torch.Tensor:
+    obs_embed = model.encode_observation(batch_state)
+    pos_energy = model.forward_with_embedding(obs_embed, batch_y).unsqueeze(1)
+    neg_actions = _sample_negative_actions(batch_y, action_bounds, num_negatives)
+    obs_embed_neg = obs_embed.unsqueeze(1).repeat(1, num_negatives, 1).reshape(-1, obs_embed.shape[-1])
+    neg_energy = model.forward_with_embedding(
+        obs_embed_neg,
+        neg_actions.reshape(-1, batch_y.shape[-1]),
+    ).reshape(batch_state.shape[0], num_negatives)
+    logits = -torch.cat([pos_energy, neg_energy], dim=1)
+    targets = torch.zeros(batch_state.shape[0], dtype=torch.long, device=batch_state.device)
+    return F.cross_entropy(logits, targets)
+
+
+def _evaluate(model, loader, device, action_bounds: np.ndarray):
+    model.eval()
+    total_loss = 0.0
+    num_batches = 0
+    with torch.inference_mode():
+        for batch_state, batch_y in loader:
+            batch_state = batch_state.to(device)
+            batch_y = batch_y.to(device)
+            loss = _implicit_bc_loss(model, batch_state, batch_y, action_bounds, NEGATIVE_SAMPLES)
+            total_loss += float(loss.item())
+            num_batches += 1
+    return total_loss / max(1, num_batches)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Train the implicit BC policy for Emio pick and place")
+    parser.add_argument(
+        "--dataset-dir",
+        type=Path,
+        default=PROJECT_DIR / "data/results/il_pick_place/episodes",
+        help="Directory containing episode_*.npz files. Relative paths are resolved from this lab folder.",
+    )
+    parser.add_argument(
+        "--output-path",
+        type=Path,
+        default=PROJECT_DIR / "data/results/il_pick_place/bc_policy.pth",
+        help="Path where the trained policy checkpoint will be saved. Relative paths are resolved from this lab folder.",
+    )
+    parser.add_argument("--epochs", type=int, default=60, help="Training epochs")
+    parser.add_argument("--batch-size", type=int, default=128, help="Batch size")
+    parser.add_argument("--learning-rate", type=float, default=1e-3, help="Adam learning rate")
+    parser.add_argument("--seed", type=int, default=0, help="Random seed")
+    parser.add_argument(
+        "--workspace-bounds-mm",
+        type=float,
+        nargs=4,
+        metavar=("X_MIN", "X_MAX", "Z_MIN", "Z_MAX"),
+        default=(-35.0, 10.0, -30.0, 20.0),
+        help="Continuous object workspace bounds recorded in checkpoint metadata.",
+    )
+    args = parser.parse_args()
+
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+
+    dataset_dir = _resolve_project_path(Path(args.dataset_dir))
+    output_path = _resolve_project_path(Path(args.output_path))
+
+    episode_paths = load_episode_paths(dataset_dir)
+    if len(episode_paths) < 3:
+        raise SystemExit("Need at least 3 saved episodes to train/validate/test the policy")
+    image_shape_signature, state_shape_signature, action_shape_signature = _validate_state_episode_paths(episode_paths)
+
+    train_paths, val_paths, test_paths = split_episode_paths(episode_paths, seed=args.seed)
+    train_state, train_actions = flatten_state_episode_dataset(train_paths)
+    val_state, val_actions = flatten_state_episode_dataset(val_paths)
+    test_state, test_actions = flatten_state_episode_dataset(test_paths)
+
+    if train_state.ndim != 2 or train_state.shape[-1] != len(STATE_FEATURE_NAMES):
+        raise SystemExit(
+            f"Expected state observations with shape [N, {len(STATE_FEATURE_NAMES)}], got {train_state.shape}"
+        )
+
+    train_state, val_state, test_state, state_mean, state_std = _prepare_states(
+        train_state,
+        val_state,
+        test_state,
+    )
+
+    print("Dataset summary:")
+    print(f"  dataset_dir={dataset_dir.resolve()}")
+    print(f"  num_episodes={len(episode_paths)}")
+    if image_shape_signature is None:
+        print("  observation_logging=none")
+    else:
+        print(
+            "  observation_logging="
+            f"[N, {image_shape_signature[0]}, {image_shape_signature[1]}, {image_shape_signature[2]}]"
+        )
+    print(f"  state_signature=[N, {state_shape_signature[0]}]")
+    print(f"  action_signature=[N, {action_shape_signature[0]}]")
+    print(f"  split_episodes train={len(train_paths)} val={len(val_paths)} test={len(test_paths)}")
+    print(f"  split_steps train={int(train_state.shape[0])} val={int(val_state.shape[0])} test={int(test_state.shape[0])}")
+
+    train_loader = _make_loader(train_state, train_actions, args.batch_size, shuffle=True)
+    val_loader = _make_loader(val_state, val_actions, args.batch_size, shuffle=False)
+    test_loader = _make_loader(test_state, test_actions, args.batch_size, shuffle=False)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = ImplicitBCPolicy(state_dim=int(train_state.shape[1])).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
+
+    action_bounds = resolve_default_motor_action_bounds()
+    best_val_loss = float("inf")
+    best_state_dict = None
+    for epoch in range(args.epochs):
+        model.train()
+        train_loss = 0.0
+        num_batches = 0
+        for batch_state, batch_y in train_loader:
+            batch_state = batch_state.to(device)
+            batch_y = batch_y.to(device)
+            optimizer.zero_grad()
+            loss = _implicit_bc_loss(model, batch_state, batch_y, action_bounds, NEGATIVE_SAMPLES)
+            loss.backward()
+            optimizer.step()
+            train_loss += float(loss.item())
+            num_batches += 1
+
+        train_loss /= max(1, num_batches)
+        val_loss = _evaluate(model, val_loader, device, action_bounds)
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_state_dict = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
+
+        if epoch % 10 == 0 or epoch == args.epochs - 1:
+            print(f"epoch={epoch:03d} train_loss={train_loss:.6f} val_loss={val_loss:.6f}")
+
+    if best_state_dict is not None:
+        model.load_state_dict(best_state_dict)
+
+    test_loss = _evaluate(model, test_loader, device, action_bounds)
+    metadata = {
+        "dataset_dir": str(dataset_dir.resolve()),
+        "train_episodes": len(train_paths),
+        "val_episodes": len(val_paths),
+        "test_episodes": len(test_paths),
+        "train_steps": int(train_state.shape[0]),
+        "val_steps": int(val_state.shape[0]),
+        "test_steps": int(test_state.shape[0]),
+        "best_val_loss": float(best_val_loss),
+        "test_loss": float(test_loss),
+        "model_type": MODEL_TYPE,
+        "action_bounds": action_bounds.tolist(),
+        "state_dim": int(train_state.shape[1]),
+        "state_feature_names": list(STATE_FEATURE_NAMES),
+        "state_mean": state_mean.astype(np.float32).tolist(),
+        "state_std": state_std.astype(np.float32).tolist(),
+        "search_config": {
+            "num_samples": 192,
+            "num_elites": 24,
+            "num_iters": 4,
+            "min_std": 0.05,
+        },
+        "warm_start": True,
+        "warm_start_std_scale": 0.35,
+        "action_smoothing_alpha": 0.35,
+        "workspace_bounds_mm": [float(value) for value in args.workspace_bounds_mm],
+    }
+    save_policy_checkpoint(output_path, model.cpu(), metadata=metadata)
+
+    print(f"Saved policy checkpoint to {output_path.resolve()}")
+    print(metadata)
+
+
+if __name__ == "__main__":
+    main()
