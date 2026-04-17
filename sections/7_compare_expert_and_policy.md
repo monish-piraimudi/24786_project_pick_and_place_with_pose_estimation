@@ -3,13 +3,20 @@
 
 Step 6 uses one interactive GUI inspection scene inside SOFA.
 
-Use the `runSofa` button below to open the camera-free learned-policy scene in Emio:
+Before you launch the scene, you can choose the initial cube start position on the tray:
 
-#runsofa-button("assets/labs/24786_project_pick_and_place_with_pose_estimation/policy_inspect_scene.py")
+#input("inspect_cube_x_mm", "Cube start X (mm)", "-3")
+#input("inspect_cube_z_mm", "Cube start Z (mm)", "12")
+
+Use the `runSofa` button below to open the camera-free learned-policy scene in Emio with that selected start pose:
+
+#runsofa-button("assets/labs/24786_project_pick_and_place_with_pose_estimation/policy_inspect_scene.py", "--cube-x-mm", "inspect_cube_x_mm", "--cube-z-mm", "inspect_cube_z_mm")
 
 ```bash
 /opt/emio-labs/resources/sofa/bin/runSofa -a \
-  assets/labs/24786_project_pick_and_place_with_pose_estimation/policy_inspect_scene.py
+  assets/labs/24786_project_pick_and_place_with_pose_estimation/policy_inspect_scene.py \
+  --cube-x-mm -3 \
+  --cube-z-mm 12
 ```
 
 This default scene:
@@ -17,8 +24,10 @@ This default scene:
 - computes the same 17D `state_observation` used during training
 - keeps the place target fixed
 - starts the learned-policy rollout automatically when the scene opens
-- lets you move the cube in the scene and rerun after each rollout
-- is intended to be used in simulation first, while still supporting the usual GUI connection toggle later if you explicitly switch to robot mode
+- lets you choose the initial cube position before launch
+- keeps the final cube pose visible after each rollout so you can inspect the outcome
+- reruns from a new start pose when you change the selected cube position
+- is intended to be used in simulation first
 
 This matches the usual Emio GUI workflow used in the other labs:
 - launch one SOFA scene

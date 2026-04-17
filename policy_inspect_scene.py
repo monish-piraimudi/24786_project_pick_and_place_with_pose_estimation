@@ -15,6 +15,7 @@ from modules.pick_place_scene_entry import create_pick_place_scene
 
 
 def createScene(rootnode):
+    extra_argv = sys.argv[1:]
     return create_pick_place_scene(
         rootnode,
         argv=[

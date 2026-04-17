@@ -137,14 +137,14 @@ def _default_task_tuning():
     """Return one selected parameter set for the task."""
 
     success_params = {
-        "gripper_opening_open": 30.0,
+        "gripper_opening_open": 40.0,
         "gripper_opening_closed": 12.0,
         "gripper_opening_min": 5.0,
-        "gripper_opening_max": 35.0,
+        "gripper_opening_max": 40.0,
         "pick_position": [-3.0, -165.0, 12.0],
         "place_position": [-24.0, -165.0, -20.0],
         "object_position": [-3.0, -170.0, 12.0],
-        "hover_lift_height": 42.0,
+        "hover_lift_height": 45.0,
         "pick_height_offset": 9.0,
         "place_height_offset": 11.0,
         "lift_success_delta": 30.0,
@@ -854,10 +854,10 @@ class PolicyInspectController(Sofa.Core.Controller):
             return
 
         if not self.is_running:
-            self._sync_scene_to_selector(update_block=True)
-            self._last_cube_selector = selected_cube
             if (slider_changed and not self.camera_tracking) or camera_pose_moved:
                 self._reset_rollout()
+            else:
+                self._last_cube_selector = selected_cube
         else:
             if self.step_count > 0:
                 self.phase, self.phase_step, self.close_counter, done = advance_phase(

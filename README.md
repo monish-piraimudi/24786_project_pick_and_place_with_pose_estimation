@@ -26,13 +26,14 @@ Instructor: **Dr. Frederike Dümbgen**
 
 ## 📌 General Description
 
-The goal of this project is to implement an autonomous **pick-and-place system** that utilizes onboard cameras and robotic manipulators from the compliance lab platform.
+The goal of this project is to build an Emio-based **pick-and-place imitation-learning lab** on top of the Compliance Lab Platform.
 
-The system will:
-- Detect stack and target locations  
-- Estimate orientation of objects  
-- Count available parts  
-- Execute precise placement into recessed targets  
+The current system:
+- runs a scripted expert pick-and-place behavior in SOFA
+- collects rollout episodes from that same scene
+- trains a state-only implicit behavior-cloning policy
+- evaluates the learned controller in closed loop
+- supports optional camera tracking and RGB logging paths for inspection and future extensions
 
 ---
 
@@ -40,14 +41,17 @@ The system will:
 
 Key technical challenges include:
 
-- **Part Orientation**  
-  Robust detection of stack, target, and part orientations for reliable placement  
+- **Consistent Task Definition**  
+  Keeping one scene as the source of truth for expert behavior, dataset collection, policy rollout, and evaluation  
 
-- **Image Enhancement**  
-  Reducing camera noise and improving detection via calibration techniques  
+- **State Design**  
+  Compressing the pick-and-place task into a compact geometric state that is expressive enough for learning while remaining simple enough to train robustly  
 
-- **Inverse Kinematics**  
-  Accurately modeling manipulator motion for precise execution  
+- **Implicit Policy Inference**  
+  Learning an energy-based state-action model and searching for low-energy motor commands reliably at runtime  
+
+- **Closed-Loop Robustness**  
+  Handling different cube start positions, rollout drift, and phase failures during policy execution and evaluation  
 
 ---
 
@@ -55,69 +59,79 @@ Key technical challenges include:
 
 We design a multi-stage pipeline:
 
-1. **Perception Layer**
-   - Detect stack and target
-   - Estimate pose and orientation  
+1. **Scene and Expert Layer**
+   - Define the Emio pick-and-place task in SOFA
+   - Run a scripted expert that performs approach, grasp, lift, place, and retreat phases  
 
-2. **Planning Layer**
-   - Select objects
-   - Compute optimal manipulator sequence  
+2. **Dataset and Training Layer**
+   - Record expert rollouts as episode files
+   - Flatten state-action pairs and train an implicit behavior-cloning policy  
 
-3. **Execution Layer**
-   - Perform autonomous pick-and-place actions  
+3. **Evaluation and Inspection Layer**
+   - Roll out the learned policy in closed loop
+   - Inspect behavior in SOFA and compare learned performance to the expert baseline  
 
 **Evaluation Metrics:**
-- Target population success rate  
-- Path efficiency and execution time  
+- Pick success rate  
+- Place success rate  
+- Total success rate  
+- Final place error  
+- Failure phase breakdown  
 
 ---
 
 ## 📈 Optimization Components
 
-This project integrates three major optimization domains:
+This project integrates several optimization-oriented components:
 
-- **Image Enhancement**  
-  Total Variation Denoising via ADMM  
+- **Implicit Behavioral Cloning**  
+  Train an energy model over state-action pairs instead of directly regressing actions  
 
-- **Inverse Kinematics Optimization**  
-  Improved joint configuration for precise pick and place operations  
+- **Action Search at Inference Time**  
+  Use a bounded Cross-Entropy Method (CEM) search to find low-energy motor-angle commands  
 
-- **Pose Estimation & Control**  
-  Real-time close loop control with optimization  
+- **State and Action Normalization**  
+  Reuse training-time normalization statistics and action bounds to keep inference stable  
+
+- **Rollout Smoothing and Control**  
+  Apply action smoothing and phase-based rollout structure for more stable closed-loop execution  
 
 ---
 
 ## 🎯 Learning Outcomes
 
 - **Research Impact**  
-  Stronger foundation in optimization for robotics and computer vision  
+  Stronger foundation in imitation learning, energy-based policies, and robot policy evaluation  
 
 - **Career Development**  
   Practical experience with:
-  - Camera-robot calibration  
-  - Autonomous manipulation  
-  - Pose estimation systems  
+  - SOFA scene construction  
+  - dataset design for imitation learning  
+  - policy training and checkpointing  
+  - closed-loop policy evaluation on robotic manipulation tasks  
 
 ---
 
 ## 🗓️ Timeline
 
 ### Before Week 13
-- Initial stack & target detection  
-- Basic pick-and-place pipeline  
+- Built the baseline Emio pick-and-place scene  
+- Implemented the scripted expert and task evaluator  
+- Established the initial collection and simulation workflow  
 
 ### Week 13
-- Implement Total Variation Denoising  
-- Improve detection and counting  
+- Added episode recording, dataset utilities, and rollout manifests  
+- Defined the compact state representation used for training and inference  
+- Integrated optional camera and tracking hooks for future extensions  
 
 ### Week 14
-- Integrate IK and pose optimization  
-- Full system testing
-- Final report and demonstration  
+- Trained the state-only implicit behavior-cloning policy  
+- Added closed-loop evaluation and SOFA inspection scenes  
+- Refined the lab walkthrough, exercises, and final documentation  
 
 ### After Week 14
-- Finalizing implementation for emio-labs software
-- Submitted for Emio – Lab Creation Contest 2026
+- Finalized the Emio Labs teaching flow and bonus design exercises  
+- Continued polishing scene controls, evaluation options, and student-facing documentation  
 
 ---
 
@@ -125,11 +139,11 @@ This project integrates three major optimization domains:
 
 # Emio.lab_empty
 
-Build your own lab for the application [Emio Labs](https://docs-support.compliance-robotics.com/docs/next/Users/EmioLabs/). In this repository you will find a template and a good starting point to create your own lab from scratch.
+This repository now contains a complete Emio imitation-learning lab for the application [Emio Labs](https://docs-support.compliance-robotics.com/docs/next/Users/EmioLabs/), rather than a blank template. The lab walks students through expert rollout inspection, dataset collection, policy training, evaluation, and interactive policy inspection in SOFA.
 
 ## Description of the files
 
-1. `lab_empty.md`: the markdown file to customize, and which will be displayed in the __Emio Labs__ application. 
+1. `lab_empty.md`: the main markdown file displayed in the __Emio Labs__ application. It includes the lab overview and pulls in the step-by-step section files. 
 2. `lab.json`: the json file for the application Emio Labs, with the title, description of the lab, and other info needed by the application:
     ```json
     {
@@ -139,11 +153,24 @@ Build your own lab for the application [Emio Labs](https://docs-support.complian
         "description": "discover...", //... and description of the lab which will appear in the main table of contents of the Emio Labs application
     }
     ```
-3. `lab_empty.py`: the python scene for __SOFA Robotics__, tipically a simulation of the robot Emio that you can launch from the Emio Labs application in exercises sections using buttons.  
-4. `setLabName.sh`: the script to set the name of your lab. This will replace all occurences of `"empty"` with your chosen name. Usage is `setLabName.sh myName`. 
-5. `requirements.txt`: the file to list the python packages required for your lab. See the README of the `modules/site-packages` directory. Or load the lab_empty in the Emio Labs application and read the "Install Additional Python Packages" section.
+3. `lab_empty.py`: the main Python scene entrypoint for __SOFA Robotics__ used to launch the scripted expert scene from the lab.  
+4. `setLabName.sh`: a legacy helper from the original lab template. It is not part of the core imitation-learning workflow, but remains in the repository. 
+5. `requirements.txt`: the Python dependency list for this lab, including packages needed for training, evaluation, and supporting utilities.
 
 ## Usage
 
-Download this repository, use the script `setLabName.sh` to update all the files with the name of your lab. Add this lab to the application and you're good to go. 
-You can follow [this documentation](https://docs-support.compliance-robotics.com/docs/next/Users/EmioLabs/create-your-lab/) to help you write the markdown file of your lab.
+Open the lab in Emio Labs and follow the guided workflow:
+1. inspect the scripted expert in SOFA
+2. collect expert demonstrations
+3. inspect the saved episode format
+4. train the implicit behavior-cloning policy
+5. evaluate the learned controller
+6. inspect expert and policy behavior interactively in SOFA
+
+For direct script usage outside the Emio Labs UI, the main entrypoints are:
+- `collect_il_dataset.py`
+- `train_il_policy.py`
+- `evaluate_il_policy.py`
+- `policy_inspect_scene.py`
+
+You can still refer to the Emio Labs authoring documentation [here](https://docs-support.compliance-robotics.com/docs/next/Users/EmioLabs/create-your-lab/) for markdown syntax and platform-specific lab features.

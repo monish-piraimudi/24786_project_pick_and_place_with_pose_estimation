@@ -56,3 +56,4 @@ Open these files and identify their roles:
 #include(assets/labs/24786_project_pick_and_place_with_pose_estimation/sections/6_evaluate_learned_policy.md)
 #include(assets/labs/24786_project_pick_and_place_with_pose_estimation/sections/7_compare_expert_and_policy.md)
 #include(assets/labs/24786_project_pick_and_place_with_pose_estimation/sections/8_summary.md)
+#include(assets/labs/24786_project_pick_and_place_with_pose_estimation/sections/9_bonus_design_exercise.md)
