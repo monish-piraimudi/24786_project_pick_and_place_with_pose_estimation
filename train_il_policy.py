@@ -188,7 +188,7 @@ def _save_loss_plot(loss_history: list[dict], test_loss: float, output_path: Pat
     ax.plot(epochs, train_losses, label="train", linewidth=2)
     ax.plot(epochs, val_losses, label="validation", linewidth=2)
     ax.axhline(test_loss, color="tab:red", linestyle="--", linewidth=1.5, label=f"test={test_loss:.4f}")
-    ax.set_title("Implicit BC cross-entropy loss (not MSE)")
+    ax.set_title("Implicit BC cross-entropy loss")
     ax.set_xlabel("Epoch")
     ax.set_ylabel("Cross-entropy loss")
     ax.grid(True, alpha=0.3)
