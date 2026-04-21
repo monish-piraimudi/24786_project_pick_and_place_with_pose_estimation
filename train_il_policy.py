@@ -1,6 +1,10 @@
 import argparse
+import os
 from pathlib import Path
 
+os.environ.setdefault("MPLCONFIGDIR", "/tmp/emio_lab_matplotlib")
+
+import matplotlib
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -19,9 +23,15 @@ from modules.pick_place_policy_shared import STATE_FEATURE_NAMES
 PROJECT_DIR = Path(__file__).resolve().parent
 NEGATIVE_SAMPLES = 63
 
+matplotlib.use("Agg")
+
 
 def _resolve_project_path(path: Path) -> Path:
     return path if path.is_absolute() else (PROJECT_DIR / path)
+
+
+def _default_loss_plot_path(output_path: Path) -> Path:
+    return output_path.with_name(f"{output_path.stem}_loss.png")
 
 
 def _describe_episode_signature(path: Path) -> tuple[tuple[int, ...] | None, tuple[int, ...], tuple[int, ...]]:
@@ -166,6 +176,28 @@ def _evaluate(model, loader, device, action_bounds: np.ndarray):
     return total_loss / max(1, num_batches)
 
 
+def _save_loss_plot(loss_history: list[dict], test_loss: float, output_path: Path) -> None:
+    import matplotlib.pyplot as plt
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    epochs = [entry["epoch"] for entry in loss_history]
+    train_losses = [entry["train_loss"] for entry in loss_history]
+    val_losses = [entry["val_loss"] for entry in loss_history]
+
+    fig, ax = plt.subplots(figsize=(8, 5), dpi=150)
+    ax.plot(epochs, train_losses, label="train", linewidth=2)
+    ax.plot(epochs, val_losses, label="validation", linewidth=2)
+    ax.axhline(test_loss, color="tab:red", linestyle="--", linewidth=1.5, label=f"test={test_loss:.4f}")
+    ax.set_title("Implicit BC cross-entropy loss (not MSE)")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Cross-entropy loss")
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(output_path)
+    plt.close(fig)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Train the implicit BC policy for Emio pick and place")
     parser.add_argument(
@@ -179,6 +211,15 @@ def main():
         type=Path,
         default=PROJECT_DIR / "data/results/il_pick_place/bc_policy.pth",
         help="Path where the trained policy checkpoint will be saved. Relative paths are resolved from this lab folder.",
+    )
+    parser.add_argument(
+        "--loss-plot-path",
+        type=Path,
+        default=None,
+        help=(
+            "Path where the training loss PNG will be saved. "
+            "Defaults to the checkpoint path with '_loss.png' appended to the stem."
+        ),
     )
     parser.add_argument("--epochs", type=int, default=60, help="Training epochs")
     parser.add_argument("--batch-size", type=int, default=128, help="Batch size")
@@ -199,6 +240,11 @@ def main():
 
     dataset_dir = _resolve_project_path(Path(args.dataset_dir))
     output_path = _resolve_project_path(Path(args.output_path))
+    loss_plot_path = (
+        _default_loss_plot_path(output_path)
+        if args.loss_plot_path is None
+        else _resolve_project_path(Path(args.loss_plot_path))
+    )
 
     episode_paths = load_episode_paths(dataset_dir)
     if len(episode_paths) < 3:
@@ -247,6 +293,7 @@ def main():
     action_bounds = resolve_default_motor_action_bounds()
     best_val_loss = float("inf")
     best_state_dict = None
+    loss_history = []
     for epoch in range(args.epochs):
         model.train()
         train_loss = 0.0
@@ -263,6 +310,13 @@ def main():
 
         train_loss /= max(1, num_batches)
         val_loss = _evaluate(model, val_loader, device, action_bounds)
+        loss_history.append(
+            {
+                "epoch": int(epoch),
+                "train_loss": float(train_loss),
+                "val_loss": float(val_loss),
+            }
+        )
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             best_state_dict = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
@@ -274,6 +328,7 @@ def main():
         model.load_state_dict(best_state_dict)
 
     test_loss = _evaluate(model, test_loader, device, action_bounds)
+    _save_loss_plot(loss_history, float(test_loss), loss_plot_path)
     metadata = {
         "dataset_dir": str(dataset_dir.resolve()),
         "train_episodes": len(train_paths),
@@ -284,6 +339,8 @@ def main():
         "test_steps": int(test_state.shape[0]),
         "best_val_loss": float(best_val_loss),
         "test_loss": float(test_loss),
+        "loss_history": loss_history,
+        "loss_plot_path": str(loss_plot_path.resolve()),
         "model_type": MODEL_TYPE,
         "action_bounds": action_bounds.tolist(),
         "state_dim": int(train_state.shape[1]),
@@ -304,6 +361,7 @@ def main():
     save_policy_checkpoint(output_path, model.cpu(), metadata=metadata)
 
     print(f"Saved policy checkpoint to {output_path.resolve()}")
+    print(f"Saved loss plot to {loss_plot_path.resolve()}")
     print(metadata)
 
 
