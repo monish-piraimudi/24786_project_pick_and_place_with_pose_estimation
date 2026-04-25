@@ -1,6 +1,6 @@
 {
-    "name": "lab_empty",
-    "filename": "lab_empty.md",
+    "name": "imitation lab",
+    "filename": "imitation_lab.md",
     "title": "Imitation Lab",
     "description": "Learn the Emio pick-and-place imitation-learning pipeline from expert rollout to policy evaluation."
 }

@@ -26,8 +26,8 @@ class WrapperEntrypointTests(unittest.TestCase):
 
         return module, calls
 
-    def test_lab_empty_wrapper_keeps_connection_available(self):
-        module, calls = self._import_wrapper_with_stub("lab_empty")
+    def test_imitation_lab_scene_entrypoint_keeps_connection_available(self):
+        module, calls = self._import_wrapper_with_stub("imitation_lab")
 
         rootnode = object()
         result = module.createScene(rootnode)

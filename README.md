@@ -137,25 +137,25 @@ This project integrates several optimization-oriented components:
 
 ## 📎 Notes
 
-# Emio.lab_empty
+# Emio.imitation_lab
 
 This repository now contains a complete Emio imitation-learning lab for the application [Emio Labs](https://docs-support.compliance-robotics.com/docs/next/Users/EmioLabs/), rather than a blank template. The lab walks students through expert rollout inspection, dataset collection, policy training, evaluation, and interactive policy inspection in SOFA.
 
 ## Description of the files
 
-1. `lab_empty.md`: the main markdown file displayed in the __Emio Labs__ application. It includes the lab overview and pulls in the step-by-step section files. 
+1. `imitation_lab.md`: the main markdown file displayed in the __Emio Labs__ application. It includes the lab overview and pulls in the step-by-step section files from `sections/`.
 2. `lab.json`: the json file for the application Emio Labs, with the title, description of the lab, and other info needed by the application:
     ```json
     {
-        "name": "lab_empty", // the name of the lab folder
-        "filename": "lab_empty.md", // the name of the markdown file
-        "title": "Lab Empty", // the title,... 
-        "description": "discover...", //... and description of the lab which will appear in the main table of contents of the Emio Labs application
+        "name": "imitation lab", // the lab name used by the application
+        "filename": "imitation_lab.md", // the name of the markdown file
+        "title": "Imitation Lab", // the title shown in Emio Labs
+        "description": "Learn the Emio pick-and-place imitation-learning pipeline from expert rollout to policy evaluation." // description shown in the main table of contents
     }
     ```
-3. `lab_empty.py`: the main Python scene entrypoint for __SOFA Robotics__ used to launch the scripted expert scene from the lab.  
-4. `setLabName.sh`: a legacy helper from the original lab template. It is not part of the core imitation-learning workflow, but remains in the repository. 
-5. `requirements.txt`: the Python dependency list for this lab, including packages needed for training, evaluation, and supporting utilities.
+3. `imitation_lab.py`: the main Python scene entrypoint for __SOFA Robotics__ used to launch the scripted expert pick-and-place scene referenced by the lab markdown.
+4. `setLabName.sh`: a legacy helper from the original lab template. It is not part of the core imitation-learning workflow, but remains in the repository.
+5. `requirements.txt`: the Python dependency list for this lab, including packages needed for data collection, policy training, evaluation, and supporting utilities.
 
 ## Usage
 
