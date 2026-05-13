@@ -40,7 +40,8 @@ class WrapperEntrypointTests(unittest.TestCase):
     def test_policy_inspect_wrapper_does_not_force_no_connection(self):
         module, calls = self._import_wrapper_with_stub("policy_inspect_scene")
 
-        module.createScene(object())
+        with mock.patch.object(sys, "argv", ["policy_inspect_scene.py"]):
+            module.createScene(object())
 
         self.assertEqual(
             calls[0]["argv"],
@@ -54,6 +55,14 @@ class WrapperEntrypointTests(unittest.TestCase):
             ],
         )
         self.assertNotIn("--no-connection", calls[0]["argv"])
+
+    def test_policy_inspect_wrapper_forwards_cube_start_arguments(self):
+        module, calls = self._import_wrapper_with_stub("policy_inspect_scene")
+
+        with mock.patch.object(sys, "argv", ["policy_inspect_scene.py", "--cube-x-mm", "14", "--cube-z-mm", "-8"]):
+            module.createScene(object())
+
+        self.assertEqual(calls[0]["argv"][-4:], ["--cube-x-mm", "14", "--cube-z-mm", "-8"])
 
     def test_policy_inspect_camera_wrapper_does_not_force_no_connection(self):
         module, calls = self._import_wrapper_with_stub("policy_inspect_camera_scene")

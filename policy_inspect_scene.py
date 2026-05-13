@@ -25,6 +25,7 @@ def createScene(rootnode):
             "data/results/il_pick_place/bc_policy.pth",
             "--no-real-rgb-observation",
             "--no-camera-tracking",
+            *extra_argv,
         ],
     )
 
