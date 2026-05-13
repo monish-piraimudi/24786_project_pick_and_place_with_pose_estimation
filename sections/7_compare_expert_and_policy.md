@@ -21,48 +21,6 @@ Use the `runSofa` button below to open the camera-free learned-policy scene in E
   --cube-z-mm 12
 ```
 
-This default scene:
-- does not require an attached Emio camera
-- computes the same 17D `state_observation` used during training
-- keeps the place target fixed
-- starts the learned-policy rollout automatically when the scene opens
-- lets you choose the initial cube position before launch
-- keeps the final cube pose visible after each rollout so you can inspect the outcome
-- reruns from a new start pose when you change the selected cube position
-- is intended to be used in simulation first
-
-For this step, use the scene in a simple loop:
-- launch one SOFA scene
-- observe one rollout
-- compare what the learned policy does to what the scripted expert would likely do from the same start pose
-- change the cube start position and look for patterns in success, failure, and behavior
-
-This still matches the usual Emio GUI workflow used in the other labs:
-- press *Play* to start the simulation
-- stay in simulation mode while testing the learned policy
-- use the GUI's *Simulation / Robot* switch only if you later want to connect to the physical robot outside this lab step; the scene stays simulation-first and does not auto-connect on launch
-
-Scripted evaluation is still useful for aggregate metrics. Example expert evaluation:
-
-```bash
-/opt/emio-labs/resources/sofa/bin/python/bin/python3.10 \
-  assets/labs/24786_project_pick_and_place_with_pose_estimation/evaluate_il_policy.py \
-  --mode expert \
-  --episodes 20 \
-  --start-seed 1000
-```
-
-Example policy evaluation on the same seeds:
-
-```bash
-/opt/emio-labs/resources/sofa/bin/python/bin/python3.10 \
-  assets/labs/24786_project_pick_and_place_with_pose_estimation/evaluate_il_policy.py \
-  --mode policy \
-  --policy-path data/results/il_pick_place/bc_policy.pth \
-  --episodes 20 \
-  --start-seed 1000
-```
-
 ::: exercise
 **Exercise:**
 

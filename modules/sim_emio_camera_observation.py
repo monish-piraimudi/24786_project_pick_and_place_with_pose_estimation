@@ -76,7 +76,7 @@ def _crop_frame(frame: np.ndarray, crop_norm_xywh: tuple[float, float, float, fl
 
     x0_px = int(np.clip(np.floor(x0 * width), 0, width - 1))
     y0_px = int(np.clip(np.floor(y0 * height), 0, height - 1))
-    x1_px = int(np.clip(np.ceil((x0 + w_norm) * width), x0_px + 1, width))
+    xpx = int(np.clip(np.ceil((x0 + w_norm) * width), x0_px + 1, width))
     y1_px = int(np.clip(np.ceil((y0 + h_norm) * height), y0_px + 1, height))
     return frame[y0_px:y1_px, x0_px:x1_px]
 
