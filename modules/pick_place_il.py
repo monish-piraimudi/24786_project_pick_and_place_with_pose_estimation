@@ -1,5 +1,4 @@
 import argparse
-import glob
 import os
 import sys
 import traceback
@@ -13,7 +12,11 @@ try:
 except ImportError:
     MyGui = None
 
-sys.path.append(os.path.dirname(os.path.realpath(__file__)) + "/../../")
+MODULE_DIR = Path(__file__).resolve().parent
+PROJECT_DIR = MODULE_DIR.parent
+PROJECT_DIR_STR = str(PROJECT_DIR)
+if PROJECT_DIR_STR not in sys.path:
+    sys.path.insert(0, PROJECT_DIR_STR)
 
 from modules.camera_observation import default_image_shape
 from modules.emio_camera_observation import EmioCameraConfig, EmioCameraObservationSource
@@ -30,7 +33,61 @@ from modules.pick_place_policy_shared import (
 
 
 _RUNTIME_TASK_TUNING = None
-PROJECT_DIR = Path(__file__).resolve().parent.parent
+OBJECT_GEOMETRY_CHOICES = ("cube", "sphere", "prism", "football")
+OBJECT_GEOMETRY_PROFILES = {
+    "cube": {
+        "display_name": "Cube",
+        "mesh_path": MODULE_DIR / "cube.obj",
+        "mesh_translation": [-5.0, -32.0, 5.0],
+        "mesh_color": [0.82, 0.62, 0.25, 1.0],
+        "tuning": {},
+        "attach_distance_threshold": 11.0,
+        "attach_offset": [0.0, -10.0, 0.0],
+    },
+    "sphere": {
+        "display_name": "Sphere",
+        "mesh_path": MODULE_DIR / "sphere.obj",
+        "mesh_translation": [-5.0, -32.0, 5.0],
+        "mesh_color": [0.36, 0.68, 0.94, 1.0],
+        "tuning": {
+            "gripper_opening_open": 38.0,
+            "gripper_opening_closed": 10.0,
+            "pick_height_offset": 7.0,
+            "place_height_offset": 9.0,
+        },
+        "attach_distance_threshold": 10.0,
+        "attach_offset": [0.0, -8.0, 0.0],
+    },
+    "prism": {
+        "display_name": "Prism",
+        "mesh_path": MODULE_DIR / "prism.obj",
+        "mesh_translation": [-5.0, -32.0, 5.0],
+        "mesh_color": [0.92, 0.44, 0.36, 1.0],
+        "tuning": {
+            "gripper_opening_open": 43.0,
+            "gripper_opening_closed": 16.0,
+            "pick_height_offset": 12.0,
+            "place_height_offset": 13.0,
+            "hover_lift_height": 48.0,
+        },
+        "attach_distance_threshold": 12.5,
+        "attach_offset": [0.0, -12.0, 0.0],
+    },
+    "football": {
+        "display_name": "Football",
+        "mesh_path": MODULE_DIR / "football.obj",
+        "mesh_translation": [-5.0, -32.0, 5.0],
+        "mesh_color": [0.48, 0.74, 0.42, 1.0],
+        "tuning": {
+            "gripper_opening_open": 44.0,
+            "gripper_opening_closed": 14.0,
+            "pick_height_offset": 10.0,
+            "place_height_offset": 12.0,
+        },
+        "attach_distance_threshold": 13.0,
+        "attach_offset": [0.0, -9.0, 0.0],
+    },
+}
 
 
 def set_runtime_task_tuning(tuning):
@@ -59,6 +116,11 @@ def _parse_scene_args(argv=None):
         "--policy-path",
         type=str,
         default="data/results/il_pick_place/bc_policy.pth",
+    )
+    parser.add_argument(
+        "--object-geometry",
+        choices=OBJECT_GEOMETRY_CHOICES,
+        default="cube",
     )
     parser.add_argument("--cube-x-mm", dest="cube_x_mm", type=float, default=None)
     parser.add_argument("--cube-z-mm", dest="cube_z_mm", type=float, default=None)
@@ -91,33 +153,35 @@ def _parse_scene_args(argv=None):
 
 def _resolve_tray_mesh_path():
     """Resolve tray mesh across local lab copies and emio-labs installs."""
-    scene_dir = os.path.dirname(os.path.realpath(__file__))
+    scene_dir = MODULE_DIR
 
     direct_candidates = [
-        os.path.normpath(os.path.join(scene_dir, "../../data/meshes/tray.stl")),
-        os.path.normpath(os.path.join(scene_dir, "../data/meshes/tray.stl")),
-        os.path.normpath(os.path.join(scene_dir, "data/meshes/tray.stl")),
+        (scene_dir / "../../data/meshes/tray.stl").resolve(),
+        (scene_dir / "../data/meshes/tray.stl").resolve(),
+        (scene_dir / "data/meshes/tray.stl").resolve(),
     ]
 
     # Try parent roots to support running from copied lab folders.
     probe = scene_dir
     for _ in range(8):
-        direct_candidates.append(os.path.join(probe, "data/meshes/tray.stl"))
-        direct_candidates.append(os.path.join(probe, "assets/data/meshes/tray.stl"))
-        parent = os.path.dirname(probe)
+        direct_candidates.append(probe / "data/meshes/tray.stl")
+        direct_candidates.append(probe / "assets/data/meshes/tray.stl")
+        parent = probe.parent
         if parent == probe:
             break
         probe = parent
 
-    # Also try emio-labs versioned installs under the user home folder.
-    emio_candidates = sorted(
-        glob.glob(os.path.expanduser("~/emio-labs/*/assets/data/meshes/tray.stl"))
-    )
-    direct_candidates.extend(emio_candidates)
+    # Also try emio-labs installs under common user roots on both Linux and Windows.
+    direct_candidates.extend(sorted(Path.home().glob("emio-labs/*/assets/data/meshes/tray.stl")))
+    localappdata = os.getenv("LOCALAPPDATA")
+    if localappdata:
+        direct_candidates.append(
+            Path(localappdata) / "Programs" / "emio-labs" / "resources" / "assets" / "data" / "meshes" / "tray.stl"
+        )
 
     for path in direct_candidates:
-        if os.path.isfile(path):
-            return path
+        if Path(path).is_file():
+            return str(path)
 
     return None
 
@@ -169,6 +233,10 @@ def _default_task_tuning():
     return fail_params
 
 
+def _object_geometry_profile(name: str) -> dict:
+    return dict(OBJECT_GEOMETRY_PROFILES[name])
+
+
 def _pick_position_for_object(object_position, reference_pick_position, reference_object_position):
     object_position = np.asarray(object_position, dtype=float).copy()
     reference_pick_position = np.asarray(reference_pick_position, dtype=float)
@@ -194,6 +262,8 @@ class PickAndPlaceEvaluator(Sofa.Core.Controller):
         place_position,
         gripper_opening_closed,
         lift_success_delta,
+        attach_distance_threshold=11.0,
+        attach_offset=(0.0, -10.0, 0.0),
     ):
         Sofa.Core.Controller.__init__(self)
         self.name = "PickAndPlaceEvaluator"
@@ -209,9 +279,9 @@ class PickAndPlaceEvaluator(Sofa.Core.Controller):
         self.gripper_opening_closed = float(gripper_opening_closed)
         self.tray_height = float(object_position[1])
         self.lift_success_delta = float(lift_success_delta)
-        self.attach_distance_threshold = 11.0
+        self.attach_distance_threshold = float(attach_distance_threshold)
         self.attach_opening_threshold = self.gripper_opening_closed + 0.5
-        self.attach_offset = np.array([0.0, -10.0, 0.0], dtype=float)
+        self.attach_offset = np.asarray(attach_offset, dtype=float)
         self.is_attached = False
         self.lifted = False
         self.placed = False
@@ -965,7 +1035,9 @@ def createScene(rootnode):
 
     print("[P3][Scene] createScene start")
     args = _parse_scene_args()
+    geometry_profile = _object_geometry_profile(args.object_geometry)
     tuning = _default_task_tuning()
+    tuning.update(geometry_profile["tuning"])
     if _RUNTIME_TASK_TUNING:
         tuning.update(_RUNTIME_TASK_TUNING)
 
@@ -1014,6 +1086,7 @@ def createScene(rootnode):
     rootnode.addData(name="cameraTrackingAvailable", type="bool", value=False)
     rootnode.addData(name="cubeStartX", type="float", value=0.0)
     rootnode.addData(name="cubeStartZ", type="float", value=0.0)
+    rootnode.addData(name="objectGeometry", type="string", value=str(args.object_geometry))
     rootnode.addData(name="policyInspectActive", type="bool", value=False)
     rootnode.addData(name="policyCheckpointPath", type="string", value="")
     print("[P3][Scene] task data added")
@@ -1140,9 +1213,7 @@ def createScene(rootnode):
             tuning["gripper_opening_min"],
             tuning["gripper_opening_max"],
         )
-        MyGui.ProgramWindow.importProgram(
-            os.path.dirname(__file__) + "/mypickandplace.crprog"
-        )
+        MyGui.ProgramWindow.importProgram(str(MODULE_DIR / "mypickandplace.crprog"))
         MyGui.IOWindow.addSubscribableData("/Gripper", opening_data)
     print("[P3][Scene] GUI controls added")
 
@@ -1190,11 +1261,11 @@ def createScene(rootnode):
     block_visual.addObject(
         "MeshOBJLoader",
         name="loader",
-        filename=os.path.join(os.path.dirname(__file__), "cube.obj"),
-        translation=[-5.0, -32.0, 5.0],
+        filename=str(geometry_profile["mesh_path"]),
+        translation=list(geometry_profile["mesh_translation"]),
     )
     block_visual.addObject("MeshTopology", src="@loader")
-    block_visual.addObject("OglModel", src="@loader", color=[0.82, 0.62, 0.25, 1.0])
+    block_visual.addObject("OglModel", src="@loader", color=list(geometry_profile["mesh_color"]))
     block_visual.addObject("RigidMapping", index=0)
 
     print("[P3][Scene] kinematic block added")
@@ -1230,6 +1301,8 @@ def createScene(rootnode):
         place_position=place_position,
         gripper_opening_closed=tuning["gripper_opening_closed"],
         lift_success_delta=tuning["lift_success_delta"],
+        attach_distance_threshold=geometry_profile["attach_distance_threshold"],
+        attach_offset=geometry_profile["attach_offset"],
     )
     rootnode.addObject(evaluator)
     print("[P3][Scene] evaluator added")
@@ -1318,6 +1391,7 @@ def createScene(rootnode):
             "Camera tracking available",
             rootnode.cameraTrackingAvailable,
         )
+        MyGui.MyRobotWindow.addInformation("Object geometry", rootnode.objectGeometry)
         MyGui.PlottingWindow.addData("camera cube x", rootnode.cameraCubeX)
         MyGui.PlottingWindow.addData("camera cube y", rootnode.cameraCubeY)
         MyGui.PlottingWindow.addData("camera cube z", rootnode.cameraCubeZ)

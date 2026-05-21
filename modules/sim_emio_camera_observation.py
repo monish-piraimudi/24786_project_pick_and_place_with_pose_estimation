@@ -76,7 +76,7 @@ def _crop_frame(frame: np.ndarray, crop_norm_xywh: tuple[float, float, float, fl
 
     x0_px = int(np.clip(np.floor(x0 * width), 0, width - 1))
     y0_px = int(np.clip(np.floor(y0 * height), 0, height - 1))
-    xpx = int(np.clip(np.ceil((x0 + w_norm) * width), x0_px + 1, width))
+    x1_px = int(np.clip(np.ceil((x0 + w_norm) * width), x0_px + 1, width))
     y1_px = int(np.clip(np.ceil((y0 + h_norm) * height), y0_px + 1, height))
     return frame[y0_px:y1_px, x0_px:x1_px]
 
@@ -296,6 +296,17 @@ class SimEmioCameraObservationSource:
 _CONTEXT_SIZE: tuple[int, int] | None = None
 
 
+def _candidate_sdl_video_drivers() -> list[str | None]:
+    explicit_driver = os.environ.get("SDL_VIDEODRIVER")
+    if explicit_driver:
+        return [explicit_driver]
+    if os.name == "nt":
+        return [None, "windows"]
+    if os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"):
+        return [None, "x11", "wayland", "offscreen"]
+    return ["offscreen", "x11", "wayland"]
+
+
 def _ensure_offscreen_gl_context(width: int, height: int) -> None:
     global _CONTEXT_SIZE
 
@@ -309,18 +320,17 @@ def _ensure_offscreen_gl_context(width: int, height: int) -> None:
 
     os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
     os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
-    if "SDL_VIDEODRIVER" not in os.environ and not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY"):
-        os.environ["SDL_VIDEODRIVER"] = "offscreen"
 
     pygame.display.quit()
     if not pygame.get_init():
         pygame.init()
 
     last_error = None
-    drivers = [os.environ.get("SDL_VIDEODRIVER")] if os.environ.get("SDL_VIDEODRIVER") else ["offscreen", "x11", "wayland"]
-    for driver in drivers:
+    for driver in _candidate_sdl_video_drivers():
         try:
-            if driver:
+            if driver is None:
+                os.environ.pop("SDL_VIDEODRIVER", None)
+            else:
                 os.environ["SDL_VIDEODRIVER"] = driver
             pygame.display.quit()
             pygame.display.init()
