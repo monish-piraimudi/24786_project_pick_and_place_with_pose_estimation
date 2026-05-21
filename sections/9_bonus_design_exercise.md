@@ -3,13 +3,26 @@
 
 The core lab assumes one cube, one pickup style, and one fixed placement setup. As a final extension, think like a system designer: how would you adapt the same Emio pipeline if the robot had to pick up different kinds of objects instead of just this one cube?
 
+You can now open three geometry variants of the scripted expert scene directly in Emio Labs:
+
+Sphere:
+#runsofa-button("assets/labs/24786_project_pick_and_place_with_pose_estimation/bonus_sphere_scene.py")
+
+Prism:
+#runsofa-button("assets/labs/24786_project_pick_and_place_with_pose_estimation/bonus_prism_scene.py")
+
+Football (oval):
+#runsofa-button("assets/labs/24786_project_pick_and_place_with_pose_estimation/bonus_football_scene.py")
+
+These bonus scenes keep the same overall pick-and-place pipeline, but swap in a different object mesh and a small grasp preset so you can inspect how geometry alone changes the task. The learned policy has not been retrained for these new shapes, so treat them as design-exploration scenes rather than benchmark policy rollouts.
+
 :::: exercise
 **Bonus Exercise:**
 
-Imagine that Emio now needs to handle several new object types, such as:
-- a taller block
-- a fragile object
-- a wider or flatter object
+Launch the three bonus simulations above and compare how the scripted expert behaves for:
+- a sphere
+- a prism
+- a football-shaped oval
 
 For each case, reason through the full system design rather than only the policy.
 

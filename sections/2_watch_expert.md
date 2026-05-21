@@ -13,6 +13,12 @@ Equivalent command-line version:
 /opt/emio-labs/resources/sofa/bin/runSofa -a assets/labs/24786_project_pick_and_place_with_pose_estimation/imitation_lab.py
 ```
 
+Windows 11 PowerShell:
+
+```powershell
+& "$env:LOCALAPPDATA\Programs\emio-labs\resources\sofa\bin\runSofa.exe" -a "assets/labs/24786_project_pick_and_place_with_pose_estimation/imitation_lab.py"
+```
+
 The demo phases are:
 - `approach_pick`
 - `descend_pick`

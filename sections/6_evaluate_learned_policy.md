@@ -17,7 +17,7 @@ Useful metrics include:
 
 Evaluate the learned policy:
 
-#python-button("assets/labs/24786_project_pick_and_place_with_pose_estimation/evaluate_il_policy.py --mode policy --policy-path data/results/il_pick_place/bc_policy.pth --workspace-bounds-mm -35 10 -30 20")
+#python-button("assets/labs/24786_project_pick_and_place_with_pose_estimation/button_evaluate_il_policy.py")
 
 Recommended manual command:
 
@@ -26,6 +26,16 @@ Recommended manual command:
   assets/labs/24786_project_pick_and_place_with_pose_estimation/evaluate_il_policy.py \
   --mode policy \
   --policy-path data/results/il_pick_place/bc_policy.pth \
+  --workspace-bounds-mm -35 10 -30 20
+```
+
+Windows 11 PowerShell:
+
+```powershell
+& "$env:LOCALAPPDATA\Programs\emio-labs\resources\sofa\bin\python\python.exe" `
+  "assets/labs/24786_project_pick_and_place_with_pose_estimation/evaluate_il_policy.py" `
+  --mode policy `
+  --policy-path data/results/il_pick_place/bc_policy.pth `
   --workspace-bounds-mm -35 10 -30 20
 ```
 

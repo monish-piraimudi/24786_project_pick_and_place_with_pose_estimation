@@ -4,12 +4,15 @@ import unittest
 import numpy as np
 
 from modules.sim_emio_camera_observation import (
+    GL,
+    GLU,
     SimEmioCameraConfig,
     SimEmioCameraObservationSource,
     _crop_frame,
     _resize_frame_nearest,
     camera_forward_up_vectors,
     compute_emio_camera_pose,
+    pygame,
 )
 
 
@@ -76,12 +79,18 @@ class ImageProcessingTests(unittest.TestCase):
 
 class SourceSmokeTests(unittest.TestCase):
     def test_update_returns_uint8_rgb(self):
+        if pygame is None or GL is None or GLU is None:
+            self.skipTest("pygame/PyOpenGL with GL support are not installed in this environment")
+
         source = SimEmioCameraObservationSource(
             _make_handles(),
             SimEmioCameraConfig(image_shape=(32, 32, 3), render_shape=(64, 64, 3)),
         )
 
-        source.open()
+        try:
+            source.open()
+        except RuntimeError as exc:
+            self.skipTest(str(exc))
         try:
             frame = source.update()
         finally:

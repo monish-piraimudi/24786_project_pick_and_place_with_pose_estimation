@@ -20,7 +20,7 @@ The default collection path is camera-free so it can run without attached hardwa
 
 Collect a starter dataset:
 
-#python-button("assets/labs/24786_project_pick_and_place_with_pose_estimation/collect_il_dataset.py --episodes 100 --max-attempts 140 --workspace-bounds-mm -35 10 -30 20 --save-failed-episodes")
+#python-button("assets/labs/24786_project_pick_and_place_with_pose_estimation/button_collect_il_dataset.py")
 
 Recommended manual command:
 
@@ -33,10 +33,28 @@ Recommended manual command:
   --save-failed-episodes
 ```
 
+Windows 11 PowerShell:
+
+```powershell
+& "$env:LOCALAPPDATA\Programs\emio-labs\resources\sofa\bin\python\python.exe" `
+  "assets/labs/24786_project_pick_and_place_with_pose_estimation/collect_il_dataset.py" `
+  --episodes 100 `
+  --max-attempts 140 `
+  --workspace-bounds-mm -35 10 -30 20 `
+  --save-failed-episodes
+```
+
 To collect with the physical camera attached, add:
 
 ```bash
   --real-rgb-observation \
+  --camera-tracking
+```
+
+On Windows PowerShell, append:
+
+```powershell
+  --real-rgb-observation `
   --camera-tracking
 ```
 

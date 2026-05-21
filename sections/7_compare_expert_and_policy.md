@@ -21,6 +21,15 @@ Use the `runSofa` button below to open the camera-free learned-policy scene in E
   --cube-z-mm 12
 ```
 
+Windows 11 PowerShell:
+
+```powershell
+& "$env:LOCALAPPDATA\Programs\emio-labs\resources\sofa\bin\runSofa.exe" -a `
+  "assets/labs/24786_project_pick_and_place_with_pose_estimation/policy_inspect_scene.py" `
+  --cube-x-mm -3 `
+  --cube-z-mm 12
+```
+
 ::: exercise
 **Exercise:**
 

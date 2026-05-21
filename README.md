@@ -154,7 +154,7 @@ This repository now contains a complete Emio imitation-learning lab for the appl
     }
     ```
 3. `imitation_lab.py`: the main Python scene entrypoint for __SOFA Robotics__ used to launch the scripted expert pick-and-place scene referenced by the lab markdown.
-4. `setLabName.sh`: a legacy helper from the original lab template. It is not part of the core imitation-learning workflow, but remains in the repository.
+4. `setLabName.sh` and `setLabName.ps1`: legacy rename helpers from the original lab template for POSIX shells and Windows PowerShell respectively. They are not part of the core imitation-learning workflow, but remain in the repository.
 5. `requirements.txt`: the Python dependency list for this lab, including packages needed for data collection, policy training, evaluation, and supporting utilities.
 
 ## Usage
@@ -172,5 +172,9 @@ For direct script usage outside the Emio Labs UI, the main entrypoints are:
 - `train_il_policy.py`
 - `evaluate_il_policy.py`
 - `policy_inspect_scene.py`
+
+On Windows 11, the SOFA executables bundled with Emio Labs are typically:
+- `runSofa.exe`: `%LOCALAPPDATA%\Programs\emio-labs\resources\sofa\bin\runSofa.exe`
+- SOFA Python: `%LOCALAPPDATA%\Programs\emio-labs\resources\sofa\bin\python\python.exe`
 
 You can still refer to the Emio Labs authoring documentation [here](https://docs-support.compliance-robotics.com/docs/next/Users/EmioLabs/create-your-lab/) for markdown syntax and platform-specific lab features.

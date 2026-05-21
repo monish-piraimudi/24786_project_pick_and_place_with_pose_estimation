@@ -29,7 +29,7 @@ The only supported checkpoint type is `implicit_bc_motor_state_v1`.
 
 Train the policy:
 
-#python-button("assets/labs/24786_project_pick_and_place_with_pose_estimation/train_il_policy.py --dataset-dir data/results/il_pick_place/episodes --output-path data/results/il_pick_place/bc_policy.pth")
+#python-button("assets/labs/24786_project_pick_and_place_with_pose_estimation/button_train_il_policy.py")
 
 Manual command:
 

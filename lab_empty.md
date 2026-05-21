@@ -46,8 +46,8 @@ Open these files and identify their roles:
 :::
 
 ::::
-
-#include(assets/labs/24786_project_pick_and_place_with_pose_estimation/sections/1_implicit_behavioral_cloning_primer.md)
+#include(assets/labs/24786_project_pick_and_place_with_pose_estimation/sections/1_task_overview.md)
+#include(assets/labs/24786_project_pick_and_place_with_pose_estimation/sections/1b_implicit_behavioral_cloning_primer.md)
 #include(assets/labs/24786_project_pick_and_place_with_pose_estimation/sections/2_watch_expert.md)
 #include(assets/labs/24786_project_pick_and_place_with_pose_estimation/sections/3_collect_expert_demonstrations.md)
 #include(assets/labs/24786_project_pick_and_place_with_pose_estimation/sections/4_inspect_episode_format.md)

@@ -83,6 +83,30 @@ class WrapperEntrypointTests(unittest.TestCase):
         )
         self.assertNotIn("--no-connection", calls[0]["argv"])
 
+    def test_bonus_sphere_wrapper_sets_object_geometry(self):
+        module, calls = self._import_wrapper_with_stub("bonus_sphere_scene")
+
+        with mock.patch.object(sys, "argv", ["bonus_sphere_scene.py"]):
+            module.createScene(object())
+
+        self.assertEqual(calls[0]["argv"], ["--no-camera-tracking", "--object-geometry", "sphere"])
+
+    def test_bonus_prism_wrapper_sets_object_geometry(self):
+        module, calls = self._import_wrapper_with_stub("bonus_prism_scene")
+
+        with mock.patch.object(sys, "argv", ["bonus_prism_scene.py"]):
+            module.createScene(object())
+
+        self.assertEqual(calls[0]["argv"], ["--no-camera-tracking", "--object-geometry", "prism"])
+
+    def test_bonus_football_wrapper_sets_object_geometry(self):
+        module, calls = self._import_wrapper_with_stub("bonus_football_scene")
+
+        with mock.patch.object(sys, "argv", ["bonus_football_scene.py"]):
+            module.createScene(object())
+
+        self.assertEqual(calls[0]["argv"], ["--no-camera-tracking", "--object-geometry", "football"])
+
 
 class PickPlaceParserTests(unittest.TestCase):
     @classmethod
@@ -141,6 +165,11 @@ class PickPlaceParserTests(unittest.TestCase):
 
         self.assertFalse(args.connection)
         self.assertTrue(args.camera_tracking)
+
+    def test_parse_scene_args_accepts_bonus_object_geometry(self):
+        args = self.module._parse_scene_args(["--object-geometry", "football"])
+
+        self.assertEqual(args.object_geometry, "football")
 
 
 if __name__ == "__main__":

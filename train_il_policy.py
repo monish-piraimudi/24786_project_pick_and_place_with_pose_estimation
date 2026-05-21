@@ -1,8 +1,11 @@
 import argparse
 import os
+import tempfile
 from pathlib import Path
 
-os.environ.setdefault("MPLCONFIGDIR", "/tmp/emio_lab_matplotlib")
+_MPL_CONFIG_DIR = Path(tempfile.gettempdir()) / "emio_lab_matplotlib"
+_MPL_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+os.environ.setdefault("MPLCONFIGDIR", str(_MPL_CONFIG_DIR))
 
 import matplotlib
 import numpy as np
