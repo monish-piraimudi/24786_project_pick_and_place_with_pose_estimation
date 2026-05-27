@@ -22,8 +22,8 @@ Manual command:
 
 ```bash
 python assets/labs/24786_project_pick_and_place_with_pose_estimation/train_il_policy.py \
-  --dataset-dir /home/dan/emio-labs/v25.12.01/assets/labs/24786_project_pick_and_place_with_pose_estimation/data/results/il_pick_place/episodes \
-  --output-path /home/dan/emio-labs/v25.12.01/assets/labs/24786_project_pick_and_place_with_pose_estimation/data/results/il_pick_place/bc_policy.pth
+  --dataset-dir ~/emio-labs/v25.12.01/assets/labs/24786_project_pick_and_place_with_pose_estimation/data/results/il_pick_place/episodes \
+  --output-path ~/emio-labs/v25.12.01/assets/labs/24786_project_pick_and_place_with_pose_estimation/data/results/il_pick_place/bc_policy.pth
 ```
 
 Output:
