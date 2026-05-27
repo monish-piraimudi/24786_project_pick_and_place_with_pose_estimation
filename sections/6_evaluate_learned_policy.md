@@ -1,11 +1,9 @@
 :::: collapse Step 5: Evaluate The Learned Policy
 ## Step 5: Evaluate The Learned Policy
 
-`evaluate_il_policy.py` rolls out either:
-- the expert controller
-- the learned policy
+You now have a trained policy — time to find out whether it actually works. `evaluate_il_policy.py` rolls out either the expert controller or the learned policy in closed loop, giving you real performance numbers rather than just the supervised training loss.
 
-Evaluation is closed-loop and reports rollout-level metrics rather than just supervised loss.
+The evaluation is closed-loop and reports rollout-level metrics rather than just supervised loss.
 
 Useful metrics include:
 - `pick_success`
@@ -44,7 +42,7 @@ Saved outputs:
 - `data/results/il_pick_place/eval/metrics.json`
 
 By default evaluation uses:
-- the same 17D geometric state vector used during state-only training
+- the same 17D geometric state vector used during training
 - the same fixed place target used during collection
 - no camera input is required
 

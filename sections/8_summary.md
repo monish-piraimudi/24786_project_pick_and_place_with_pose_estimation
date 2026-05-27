@@ -3,27 +3,17 @@
 
 In this lab you:
 - inspected the pick-and-place scene in SOFA
-- used that exact scene to generate imitation-learning episodes
-- trained a state-only implicit behavior-cloning policy
-- evaluated the learned controller in closed loop
+- used that scene to generate expert demonstrations
+- trained a state-based implicit behavior-cloning policy
+- evaluated the learned policy in closed loop
 - compared expert and learned rollout performance
 
-The key idea is that one scene drives the whole pipeline:
-- scene definition in `modules/pick_place_il.py`
-- runtime collection and evaluation in `modules/pick_place_il_runtime.py`
-- optional RGB logging and tracker capture in `modules/emio_camera_observation.py`
-- offline training in `train_il_policy.py`
+One of the key limitations of the current approach is that the policy is closely tied to a specific state representation and a fixed workspace configuration. It relies on a hand-crafted 17D geometric state vector and a pre-defined phase structure from the expert controller, rather than learning a fully end-to-end neural policy. This makes the system easier to train and debug, but also means that any change to the task — a new placement target, a different object, or a wider workspace — requires new demonstrations and potentially a new state definition.
 
-The recommended GUI workflow stays simulation-first:
-- launch one SOFA scene
-- inspect the learned rollout in simulation mode
-- use the Emio GUI's Simulation / Robot switch only when you intentionally want hardware execution outside the lab walkthrough; the scene does not connect on launch
-
-From here, you can experiment with:
-- more demonstrations
-- wider workspace bounds
-- different compact state definitions
-- different implicit-policy search hyperparameters
-- alternative action parameterizations
+From here, there are several directions worth exploring:
+- more demonstrations and wider workspace bounds to improve generalisation
+- different compact state definitions that capture new task-relevant geometry
+- alternative action parameterizations or different implicit-policy search hyperparameters
+- adding RGB image observations to the state, enabling the policy to handle tasks where geometry alone is not sufficient — for example, distinguishing objects by appearance or handling partial occlusion
 
 ::::
