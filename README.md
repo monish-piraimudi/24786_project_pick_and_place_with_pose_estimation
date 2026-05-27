@@ -16,4 +16,4 @@
 
 # Implicit-Policy based Behavioral Cloning for Generalizable Pick-and-Place Operations
 
-This repository contains the documentation and implementation of the emio-labs contest submission by **Daniel Jung** and **Monish Piraimudi**.
+This repository contains the documentation and implementation of the emio-labs contest submission by **Dan Jung** and **Monish Piraimudi**.
