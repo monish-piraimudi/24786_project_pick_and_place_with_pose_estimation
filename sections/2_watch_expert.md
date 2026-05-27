@@ -1,22 +1,22 @@
 :::: collapse Step 1: Watch The Expert In SOFA
 ## Step 1: Watch The Expert In SOFA
 
-The SOFA scene launched from `imitation_lab.py` is the scene entrypoint used by `imitation_lab.md`. It runs the scripted expert demo directly, and this is the behavior that later generates the imitation-learning episodes.
+The SOFA scene launched from `imitation_lab.py` is the scene entrypoint used in this lab. It runs the scripted expert demo directly, and this is the behavior that later generates the imitation-learning episodes.
 
 Launch the scene:
 
-#runsofa-button("assets/labs/24786_project_pick_and_place_with_pose_estimation/imitation_lab.py")
+#runsofa-button("assets/labs/lab_imitation/imitation_lab.py")
 
 Equivalent command-line version:
 
 ```bash
-/opt/emio-labs/resources/sofa/bin/runSofa -a assets/labs/24786_project_pick_and_place_with_pose_estimation/imitation_lab.py
+/opt/emio-labs/resources/sofa/bin/runSofa -a assets/labs/lab_imitation/imitation_lab.py
 ```
 
 Windows 11 PowerShell:
 
 ```powershell
-& "$env:LOCALAPPDATA\Programs\emio-labs\resources\sofa\bin\runSofa.exe" -a "assets/labs/24786_project_pick_and_place_with_pose_estimation/imitation_lab.py"
+& "$env:LOCALAPPDATA\Programs\emio-labs\resources\sofa\bin\runSofa.exe" -a "assets/labs/lab_imitation/imitation_lab.py"
 ```
 
 The demo phases are:

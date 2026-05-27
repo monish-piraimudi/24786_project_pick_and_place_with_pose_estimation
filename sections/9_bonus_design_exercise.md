@@ -41,6 +41,5 @@ Then propose:
 
 The goal is not to produce one perfect answer. The goal is to show that you can connect object properties to the design of the scene, the state, the demonstrations, the policy, and the evaluation pipeline.
 
-:::
 
 ::::
